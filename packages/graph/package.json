@@ -1,0 +1,12 @@
+{
+  "name": "@yatrasarthi/graph",
+  "version": "1.0.0",
+  "main": "src/tripGraph.ts",
+  "types": "src/tripGraph.ts",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}

@@ -1,0 +1,1111 @@
+﻿diff --git a/apps/web/src/app/api/actions/[id]/confirm/route.ts b/apps/web/src/app/api/actions/[id]/confirm/route.ts
+index 21e9ea7..4adf235 100644
+--- a/apps/web/src/app/api/actions/[id]/confirm/route.ts
++++ b/apps/web/src/app/api/actions/[id]/confirm/route.ts
+@@ -1,27 +1,99 @@
+ import { NextResponse } from 'next/server';
+ import clientPromise from '@/lib/mongodb';
++import { ObjectId } from 'mongodb';
++import { getSessionUser } from '@/lib/auth';
++import { publishTripEvent, appendEventLog } from '@/lib/realtime';
+ 
+-export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
++/**
++ * POST /api/actions/:id/confirm
++ * Body: { confirmType: 'self_reported' | 'vendor_verified'; proofRef?: string }
++ *
++ * Marks the action as confirmed (state ΓåÆ 'confirmed'), records confirmType and optional proofRef,
++ * then checks if all trip actions are now confirmed to flip the trip back to 'healthy'.
++ * Publishes realtime event and writes to event log.
++ */
++export async function POST(
++  request: Request,
++  { params }: { params: Promise<{ id: string }> }
++) {
+   try {
+     const { id } = await params;
++    const user = await getSessionUser(request);
++    if (!user) {
++      return NextResponse.json(
++        { error: { code: 'AUTH_REQUIRED', message: 'Authentication required.' } },
++        { status: 401 }
++      );
++    }
++
+     const body = await request.json();
+-    const { proofRef, confirmType } = body; // 'self-reported' | 'vendor-verified'
++    const { confirmType, proofRef } = body as {
++      confirmType: 'self_reported' | 'vendor_verified';
++      proofRef?: string;
++    };
++
++    if (!confirmType || !['self_reported', 'vendor_verified'].includes(confirmType)) {
++      return NextResponse.json(
++        { error: { code: 'VALIDATION_ERROR', message: 'confirmType must be self_reported or vendor_verified.' } },
++        { status: 422 }
++      );
++    }
+ 
+     const client = await clientPromise;
+     const db = client.db();
+ 
+-    // Mark action as confirmed
+-    await db.collection('actions').updateOne(
+-      { id }, // or _id depending on schema
+-      { $set: { state: 'completed', confirmType, proofRef, confirmedAt: new Date() } }
+-    );
++    // Find the action ΓÇö try ObjectId first, then string id field
++    let action: any = null;
++    if (ObjectId.isValid(id)) {
++      action = await db.collection('actions').findOne({ _id: new ObjectId(id) });
++    }
++    if (!action) {
++      action = await db.collection('actions').findOne({ id });
++    }
++    if (!action) {
++      return NextResponse.json({ error: { code: 'NOT_FOUND', message: 'Action not found.' } }, { status: 404 });
++    }
++
++    const now = new Date().toISOString();
++    const update: Record<string, any> = {
++      state: 'confirmed',
++      confirmType,
++      confirmedAt: now,
++      updatedAt: now,
++    };
++    if (proofRef) update.proofRef = proofRef;
++
++    const filter = ObjectId.isValid(id) ? { _id: new ObjectId(id) } : { id };
++    await db.collection('actions').updateOne(filter, { $set: update });
++
++    // Check if all actions for this trip are now confirmed ΓåÆ flip trip to healthy
++    const tripId: string = action.tripId;
++    const pendingActions = await db.collection('actions').countDocuments({
++      tripId,
++      state: { $nin: ['confirmed', 'failed'] },
++    });
++
++    if (pendingActions === 0) {
++      await db.collection('trips').updateOne(
++        { _id: new ObjectId(tripId) },
++        { $set: { status: 'healthy', healthScore: 100 } }
++      );
++      await publishTripEvent(tripId, { type: 'trip.updated', entityId: tripId });
++    }
+ 
+-    // In a real flow, this triggers the cascade/re-eval to turn trip status back to 'healthy'
+-    // if all recovery actions are complete.
++    await Promise.all([
++      publishTripEvent(tripId, { type: 'action.updated', entityId: id }),
++      appendEventLog(db, {
++        tripId,
++        actor: user.id,
++        type: 'action.confirmed',
++        payload: { actionId: id, confirmType, proofRef: proofRef ?? null },
++      }),
++    ]);
+ 
+-    return NextResponse.json({ success: true });
++    return NextResponse.json({ data: { actionId: id, state: 'confirmed', confirmType } });
+   } catch (error) {
+-    console.error('Failed to confirm action', error);
+-    return NextResponse.json({ error: 'Failed to confirm action' }, { status: 500 });
++    console.error('[confirm] Failed to confirm action:', error);
++    return NextResponse.json({ error: { code: 'INTERNAL', message: 'Failed to confirm action.' } }, { status: 500 });
+   }
+ }
+diff --git a/apps/web/src/app/api/actions/[id]/propose/route.ts b/apps/web/src/app/api/actions/[id]/propose/route.ts
+index 14a83ad..44b99d3 100644
+--- a/apps/web/src/app/api/actions/[id]/propose/route.ts
++++ b/apps/web/src/app/api/actions/[id]/propose/route.ts
+@@ -1,32 +1,94 @@
+ import { NextResponse } from 'next/server';
+ import clientPromise from '@/lib/mongodb';
++import { ObjectId } from 'mongodb';
++import { getSessionUser } from '@/lib/auth';
++import { publishTripEvent, appendEventLog } from '@/lib/realtime';
+ 
+-export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
++/**
++ * POST /api/actions/:id/propose
++ * Body: { tripId, optionId, disruptionId, costTotal, membersToCharge: [{ memberId, amount }] }
++ *
++ * Creates an action in 'proposed' state with a proper agreements[] array (one entry per trip member),
++ * all set to 'pending'. Also broadcasts the event via Ably and writes to the event log.
++ */
++export async function POST(
++  request: Request,
++  { params }: { params: Promise<{ id: string }> }
++) {
+   try {
+     const { id } = await params;
++    const user = await getSessionUser(request);
++    if (!user) {
++      return NextResponse.json(
++        { error: { code: 'AUTH_REQUIRED', message: 'Authentication required.' } },
++        { status: 401 }
++      );
++    }
++
+     const body = await request.json();
+-    const { tripId, optionId, memberId } = body;
++    const { tripId, optionId, disruptionId, costTotal, membersToCharge } = body;
++
++    if (!tripId || !optionId) {
++      return NextResponse.json(
++        { error: { code: 'VALIDATION_ERROR', message: 'tripId and optionId are required.' } },
++        { status: 422 }
++      );
++    }
+ 
+     const client = await clientPromise;
+     const db = client.db();
+ 
+-    const action = {
+-      id: `action_${id}_${Date.now()}`,
++    // Load the trip to get its full member list (so agreements[] covers everyone)
++    const trip = await db.collection('trips').findOne({ _id: new ObjectId(tripId) });
++    if (!trip) {
++      return NextResponse.json({ error: { code: 'NOT_FOUND', message: 'Trip not found.' } }, { status: 404 });
++    }
++
++    const memberIds: string[] = trip.memberIds ?? [];
++
++    const now = new Date().toISOString();
++    const actionDoc = {
+       tripId,
+-      state: 'proposed',
+-      confirmType: 'self-reported',
++      disruptionId: disruptionId ?? null,
+       optionId,
+-      proposedBy: memberId,
+-      createdAt: new Date()
++      state: 'proposed',
++      confirmType: null,
++      proofRef: null,
++      proposedBy: user.id,
++      costTotal: costTotal ?? 0,
++      // One agreement entry per trip member ΓÇö all start as 'pending'
++      agreements: memberIds.map((memberId: string) => ({
++        memberId,
++        response: 'pending' as const,
++        respondedAt: null,
++      })),
++      membersToCharge: membersToCharge ?? [],
++      vendorDraft: null,
++      createdAt: now,
++      updatedAt: now,
++      version: 1,
+     };
+ 
+-    await db.collection('actions').insertOne(action);
++    const result = await db.collection('actions').insertOne(actionDoc);
++    const actionId = result.insertedId.toString();
++
++    // Publish realtime event + append to event log
++    await Promise.all([
++      publishTripEvent(tripId, { type: 'action.updated', entityId: actionId, version: 1 }),
++      appendEventLog(db, {
++        tripId,
++        actor: user.id,
++        type: 'action.proposed',
++        payload: { actionId, optionId, costTotal: costTotal ?? 0 },
++      }),
++    ]);
+ 
+-    // Broadcast via realtime channel here (Person 5 logic)
+-    
+-    return NextResponse.json({ success: true, action }, { status: 201 });
++    return NextResponse.json(
++      { data: { action: { id: actionId, ...actionDoc } } },
++      { status: 201 }
++    );
+   } catch (error) {
+-    console.error('Failed to propose action', error);
+-    return NextResponse.json({ error: 'Failed to propose action' }, { status: 500 });
++    console.error('[propose] Failed to propose action:', error);
++    return NextResponse.json({ error: { code: 'INTERNAL', message: 'Failed to propose action.' } }, { status: 500 });
+   }
+ }
+diff --git a/apps/web/src/app/api/payments/create-links/route.ts b/apps/web/src/app/api/payments/create-links/route.ts
+index f9929ac..021bc31 100644
+--- a/apps/web/src/app/api/payments/create-links/route.ts
++++ b/apps/web/src/app/api/payments/create-links/route.ts
+@@ -1,33 +1,88 @@
+ import { NextResponse } from 'next/server';
+ import clientPromise from '@/lib/mongodb';
++import { getSessionUser } from '@/lib/auth';
++import { publishTripEvent, appendEventLog } from '@/lib/realtime';
+ 
++/**
++ * POST /api/payments/create-links
++ * Body: { tripId, actionId, payers: [{ memberId, amount }] }
++ *
++ * Creates one mock payment record per payer. No real payment gateway is used.
++ * Payment URLs are simulated as internal links so the demo flow works end-to-end.
++ * Each record gets a unique id, deadlineAt (24h), and 'pending' status.
++ *
++ * Broadcasts a payment.updated event and writes to the event log.
++ */
+ export async function POST(request: Request) {
+   try {
+-    const { tripId, actionId, payers } = await request.json();
+-    
++    const user = await getSessionUser(request);
++    if (!user) {
++      return NextResponse.json(
++        { error: { code: 'AUTH_REQUIRED', message: 'Authentication required.' } },
++        { status: 401 }
++      );
++    }
++
++    const body = await request.json();
++    const { tripId, actionId, payers } = body as {
++      tripId: string;
++      actionId: string;
++      payers: { memberId: string; amount: number }[];
++    };
++
++    if (!tripId || !actionId || !Array.isArray(payers) || payers.length === 0) {
++      return NextResponse.json(
++        { error: { code: 'VALIDATION_ERROR', message: 'tripId, actionId, and payers[] are required.' } },
++        { status: 422 }
++      );
++    }
++
+     const client = await clientPromise;
+     const db = client.db();
+ 
+-    const paymentLinks = payers.map((payer: any) => {
+-      // Mock Razorpay test-mode link creation
+-      const mockPaymentId = `pay_${Math.random().toString(36).substring(2, 9)}`;
++    const now = new Date();
++    const deadlineAt = new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString(); // 24h from now
++
++    // Build one payment record per payer ΓÇö no real gateway, just a mock reference
++    const paymentDocs = payers.map((payer) => {
++      const mockRef = `demo_${Math.random().toString(36).substring(2, 11)}`;
+       return {
+-        id: mockPaymentId,
+         tripId,
+         actionId,
+         memberId: payer.memberId,
+         amount: payer.amount,
+         status: 'pending',
+-        paymentUrl: `https://test.razorpay.com/pay/${mockPaymentId}`,
+-        createdAt: new Date()
++        // Demo payment URL ΓÇö points to the in-app payment status screen, not a real gateway
++        paymentLinkUrl: `/pay/${mockRef}?tripId=${tripId}&actionId=${actionId}`,
++        aggregatorRef: mockRef,
++        deadlineAt,
++        createdAt: now.toISOString(),
++        paidAt: null,
+       };
+     });
+ 
+-    await db.collection('payments').insertMany(paymentLinks);
++    const result = await db.collection('payments').insertMany(paymentDocs);
++    const insertedIds = Object.values(result.insertedIds).map(id => id.toString());
++
++    const links = paymentDocs.map((doc, i) => ({
++      id: insertedIds[i],
++      ...doc,
++    }));
++
++    // Publish realtime event
++    await Promise.all([
++      publishTripEvent(tripId, { type: 'payment.updated', entityId: actionId }),
++      appendEventLog(db, {
++        tripId,
++        actor: user.id,
++        type: 'payment.links_created',
++        payload: { actionId, payerCount: payers.length },
++      }),
++    ]);
+ 
+-    return NextResponse.json({ success: true, links: paymentLinks }, { status: 201 });
++    return NextResponse.json({ data: { links } }, { status: 201 });
+   } catch (error) {
+-    console.error('Failed to create payment links', error);
+-    return NextResponse.json({ error: 'Failed to create payment links' }, { status: 500 });
++    console.error('[create-links] Failed to create payment links:', error);
++    return NextResponse.json({ error: { code: 'INTERNAL', message: 'Failed to create payment links.' } }, { status: 500 });
+   }
+ }
+diff --git a/apps/web/src/app/api/trips/[id]/graph/route.ts b/apps/web/src/app/api/trips/[id]/graph/route.ts
+index b8df254..ca98fc6 100644
+--- a/apps/web/src/app/api/trips/[id]/graph/route.ts
++++ b/apps/web/src/app/api/trips/[id]/graph/route.ts
+@@ -1,35 +1,108 @@
+ import { NextResponse } from 'next/server';
+ import clientPromise from '@/lib/mongodb';
+ import { ObjectId } from 'mongodb';
++import { TripGraph } from '@yatrasarthi/graph';
+ 
++/**
++ * GET /api/trips/:id/graph
++ * Returns nodes, edges, trip health score and cascade-computed statuses.
++ * Runs TripGraph to recompute which nodes are broken/at_risk based on current edge buffers,
++ * then persists any status changes back to the DB before responding.
++ */
+ export async function GET(request: Request, { params }: { params: Promise<{ id: string }> }) {
+   try {
+     const { id } = await params;
+     const client = await clientPromise;
+     const db = client.db();
+-    const tripId = id; // Or new ObjectId(id) if trip ids are ObjectIds in nodes/edges
+ 
+     const [trip, nodes, edges] = await Promise.all([
+-      db.collection('trips').findOne({ _id: new ObjectId(tripId) }),
+-      db.collection('nodes').find({ tripId }).toArray(),
+-      db.collection('edges').find({ tripId }).toArray()
++      db.collection('trips').findOne({ _id: new ObjectId(id) }),
++      db.collection('nodes').find({ tripId: id }).sort({ time: 1 }).toArray(),
++      db.collection('edges').find({ tripId: id }).toArray(),
+     ]);
+ 
+     if (!trip) {
+       return NextResponse.json({ error: 'Trip not found' }, { status: 404 });
+     }
+ 
+-    const mappedNodes = nodes.map(n => ({ ...n, id: n._id.toString() }));
+-    const mappedEdges = edges.map(e => ({ ...e, id: e._id.toString() }));
++    // Map raw mongo docs to typed shape with string ids
++    const mappedNodes = nodes.map((n: any) => ({ ...n, id: n.id ?? n._id.toString(), _id: undefined }));
++    const mappedEdges = edges.map((e: any) => ({ ...e, id: e.id ?? e._id.toString(), _id: undefined }));
++
++    // Run TripGraph to re-evaluate cascade from any currently-broken node
++    const graph = new TripGraph();
++    mappedNodes.forEach((n: any) => graph.addNode(n.id));
++    mappedEdges.forEach((e: any) =>
++      graph.addEdge({
++        from: e.fromNodeId,
++        to: e.toNodeId,
++        bufferMin: e.bufferMin ?? 0,
++        paddingMin: e.paddingMin ?? 0,
++        constraint: e.constraint ?? 'soft',
++      })
++    );
++
++    // Find any nodes already marked broken ΓÇö rerun cascade from each
++    const brokenNodes = mappedNodes.filter((n: any) => n.status === 'broken');
++    let allBroken = new Set<string>(brokenNodes.map((n: any) => n.id));
++    let allAtRisk = new Set<string>();
++
++    for (const bn of brokenNodes) {
++      const { broken, atRisk } = graph.propagateDelay(bn.id, bn.delay ?? 60);
++      broken.forEach((nid) => allBroken.add(nid));
++      atRisk.forEach((nid) => allAtRisk.add(nid));
++    }
++
++    // Remove at_risk from broken if both appear (broken wins)
++    allAtRisk.forEach((nid) => { if (allBroken.has(nid)) allAtRisk.delete(nid); });
++
++    // Merge cascade results back onto the nodes we return
++    const finalNodes = mappedNodes.map((n: any) => {
++      if (allBroken.has(n.id)) return { ...n, status: 'broken' };
++      if (allAtRisk.has(n.id)) return { ...n, status: 'at_risk' };
++      return n;
++    });
++
++    // Recompute health score: 100 - 20*broken - 10*at_risk, floored at 0
++    const newHealthScore = Math.max(0, 100 - (allBroken.size * 20) - (allAtRisk.size * 10));
++    const newTripStatus = allBroken.size > 0 ? 'needs_attention' : allAtRisk.size > 0 ? 'needs_attention' : 'healthy';
++
++    // Persist health score + node statuses back to DB (fire-and-forget, don't block response)
++    const dbUpdates: Promise<any>[] = [];
++
++    if (allBroken.size > 0) {
++      dbUpdates.push(
++        db.collection('nodes').updateMany(
++          { tripId: id, id: { $in: [...allBroken] } },
++          { $set: { status: 'broken' } }
++        )
++      );
++    }
++    if (allAtRisk.size > 0) {
++      dbUpdates.push(
++        db.collection('nodes').updateMany(
++          { tripId: id, id: { $in: [...allAtRisk] } },
++          { $set: { status: 'at_risk' } }
++        )
++      );
++    }
++    dbUpdates.push(
++      db.collection('trips').updateOne(
++        { _id: new ObjectId(id) },
++        { $set: { healthScore: newHealthScore, status: newTripStatus } }
++      )
++    );
++
++    await Promise.all(dbUpdates);
+ 
+     return NextResponse.json({
+-      healthScore: trip.healthScore,
+-      status: trip.status,
+-      nodes: mappedNodes,
+-      edges: mappedEdges
++      healthScore: newHealthScore,
++      status: newTripStatus,
++      nodes: finalNodes,
++      edges: mappedEdges,
+     });
+   } catch (error) {
+-    console.error('Failed to fetch graph', error);
++    console.error('[graph] Failed to fetch graph:', error);
+     return NextResponse.json({ error: 'Failed to fetch graph' }, { status: 500 });
+   }
+ }
+diff --git a/apps/web/src/app/api/trips/[id]/group/route.ts b/apps/web/src/app/api/trips/[id]/group/route.ts
+index 895f7e4..65b3eda 100644
+--- a/apps/web/src/app/api/trips/[id]/group/route.ts
++++ b/apps/web/src/app/api/trips/[id]/group/route.ts
+@@ -1,26 +1,93 @@
+ import { NextResponse } from 'next/server';
+ import clientPromise from '@/lib/mongodb';
++import { ObjectId } from 'mongodb';
+ 
++/**
++ * GET /api/trips/:id/group
++ * Returns real member data from the DB ΓÇö who is on which leg, shared nodes, and the weakest link.
++ * Previously returned hardcoded Tanvi/Priya mock; now reads from `trips`, `users`, and `nodes`.
++ */
+ export async function GET(request: Request, { params }: { params: Promise<{ id: string }> }) {
+   try {
+     const { id } = await params;
+     const client = await clientPromise;
+     const db = client.db();
+ 
+-    // Mock response that follows the API contract
++    // 1. Load the trip to get memberIds
++    const trip = await db.collection('trips').findOne({ _id: new ObjectId(id) });
++    if (!trip) {
++      return NextResponse.json({ error: 'Trip not found' }, { status: 404 });
++    }
++
++    const memberIds: string[] = trip.memberIds ?? [];
++
++    // 2. Load user docs for all members
++    const userDocs = memberIds.length > 0
++      ? await db.collection('users').find({
++          $or: [
++            { _id: { $in: memberIds.map(m => { try { return new ObjectId(m); } catch { return m; } }) } },
++            { id: { $in: memberIds } },
++          ],
++        }).toArray()
++      : [];
++
++    // 3. Load all nodes for this trip, sorted by time
++    const allNodes = await db.collection('nodes').find({ tripId: id }).sort({ time: 1 }).toArray();
++
++    // 4. For each member, find their most recently active / upcoming node
++    const memberStatuses = userDocs.map((u: any) => {
++      const userId = u._id.toString();
++      // Nodes owned by this member or shared
++      const memberNodes = allNodes.filter(
++        (n: any) => n.ownerId === userId || (n.sharedByMemberIds ?? []).includes(userId)
++      );
++
++      // The "current leg" is the first node that is not yet confirmed (pending_review, on_track, at_risk, broken)
++      const currentNode =
++        memberNodes.find((n: any) => ['on_track', 'at_risk', 'broken', 'pending_review'].includes(n.status)) ??
++        memberNodes[memberNodes.length - 1];
++
++      // Derive a per-member status from their worst node status
++      const statusPriority: Record<string, number> = { broken: 4, at_risk: 3, pending_review: 2, on_track: 1, confirmed: 0 };
++      const worstStatus = memberNodes.reduce((worst: string, n: any) => {
++        return (statusPriority[n.status] ?? 0) > (statusPriority[worst] ?? 0) ? n.status : worst;
++      }, 'on_track');
++
++      return {
++        memberId: userId,
++        name: u.name || u.phone || 'Traveler',
++        currentLeg: currentNode?.label ?? 'No bookings yet',
++        currentNodeId: currentNode?._id?.toString() ?? null,
++        status: worstStatus,
++      };
++    });
++
++    // 5. Find shared nodes (nodes with sharedByMemberIds length > 1)
++    const sharedNodes = allNodes
++      .filter((n: any) => Array.isArray(n.sharedByMemberIds) && n.sharedByMemberIds.length > 1)
++      .map((n: any) => ({
++        nodeId: n._id.toString(),
++        label: n.label,
++        sharedByCount: n.sharedByMemberIds.length,
++      }));
++
++    // 6. Find the weakest link ΓÇö member with the worst status
++    const statusPriority: Record<string, number> = { broken: 4, at_risk: 3, pending_review: 2, on_track: 1, confirmed: 0 };
++    const weakestMember = memberStatuses.reduce(
++      (weakest, m) =>
++        (statusPriority[m.status] ?? 0) > (statusPriority[weakest?.status ?? 'on_track'] ?? 0) ? m : weakest,
++      memberStatuses[0] ?? null
++    );
++
+     return NextResponse.json({
+       data: {
+-        members: [
+-          { memberId: 'm1', name: 'Tanvi', currentLeg: 'IndiGo 6E-204', status: 'on_track' },
+-          { memberId: 'm2', name: 'Priya', currentLeg: 'Vande Bharat Express', status: 'at_risk' },
+-        ],
+-        sharedNodes: [
+-          { nodeId: 'n_shared', label: 'Goa airport cab', sharedByCount: 4 }
+-        ],
+-        weakestLinkMemberId: 'm2'
+-      }
++        members: memberStatuses,
++        sharedNodes,
++        weakestLinkMemberId: weakestMember?.memberId ?? null,
++      },
+     });
+   } catch (error) {
++    console.error('[group] Failed to fetch group:', error);
+     return NextResponse.json({ error: 'Failed to fetch group' }, { status: 500 });
+   }
+ }
+diff --git a/apps/web/src/app/api/users/me/delete/route.ts b/apps/web/src/app/api/users/me/delete/route.ts
+new file mode 100644
+index 0000000..65792fe
+--- /dev/null
++++ b/apps/web/src/app/api/users/me/delete/route.ts
+@@ -0,0 +1,50 @@
++import { NextResponse } from 'next/server';
++import clientPromise from '@/lib/mongodb';
++import { ObjectId } from 'mongodb';
++import { getSessionUser } from '@/lib/auth';
++import { cookies } from 'next/headers';
++
++/**
++ * DELETE /api/users/me
++ * Hard-deletes the authenticated user's account and removes them from all trips.
++ * Also clears the session cookie.
++ */
++export async function DELETE(request: Request) {
++  try {
++    const user = await getSessionUser(request);
++    if (!user) {
++      return NextResponse.json(
++        { error: { code: 'AUTH_REQUIRED', message: 'Authentication required.' } },
++        { status: 401 }
++      );
++    }
++
++    const client = await clientPromise;
++    const db = client.db();
++
++    const filter = ObjectId.isValid(user.id)
++      ? { _id: new ObjectId(user.id) }
++      : { id: user.id };
++
++    // 1. Remove user from all trips they are a member of
++    await db.collection('trips').updateMany(
++      { memberIds: user.id },
++      { $pull: { memberIds: user.id } as any }
++    );
++
++    // 2. Delete the user document
++    const result = await db.collection('users').deleteOne(filter);
++    if (result.deletedCount === 0) {
++      return NextResponse.json({ error: { code: 'NOT_FOUND', message: 'User not found.' } }, { status: 404 });
++    }
++
++    // 3. Clear the session cookie
++    const cookieStore = await cookies();
++    cookieStore.delete('yatrasarthi_session');
++
++    return NextResponse.json({ data: { deleted: true } });
++  } catch (error) {
++    console.error('[DELETE /users/me] Error:', error);
++    return NextResponse.json({ error: { code: 'INTERNAL', message: 'Failed to delete account.' } }, { status: 500 });
++  }
++}
+diff --git a/apps/web/src/lib/recoveryRanker.ts b/apps/web/src/lib/recoveryRanker.ts
+index e5f70d5..10f02f7 100644
+--- a/apps/web/src/lib/recoveryRanker.ts
++++ b/apps/web/src/lib/recoveryRanker.ts
+@@ -1,48 +1,213 @@
+ import { Node, Edge } from '@yatrasarthi/types';
++import { TripGraph } from '@yatrasarthi/graph';
+ 
+-export function generateRecoveryOptions(tripId: string, nodes: Node[], edges: Edge[], brokenNodeId: string) {
+-  // A simplistic mock ranker for the demo
+-  // 1. Feasibility filter: e.g. drop options that miss hard constraints
+-  // 2. Scoring: Pareto front across cost, time, and bookings preserved
+-
+-  const options = [
+-    {
+-      id: 'opt1',
+-      label: 'Plan A: Rebook Flight',
+-      tagline: 'Fastest recovery, highest cost',
+-      icon: 'Γ£ê∩╕Å',
+-      additionalCost: 8500,
+-      bookingsPreserved: 5,
+-      totalBookings: 5,
+-      timeSaved: 120,
++/**
++ * Real recovery option ranker.
++ *
++ * Strategy:
++ * 1. Find the broken node and all downstream nodes it affects via TripGraph.
++ * 2. Generate candidate recovery strategies (skip broken, reschedule downstream, add phantom leg).
++ * 3. Score each candidate on 3 axes: cost, time penalty, bookings preserved.
++ * 4. Normalise scores 0-100, compute a weighted total, sort descending.
++ * 5. Return top 3 options.
++ */
++
++interface RawNode extends Node {
++  _id?: any;
++  delay?: number;
++}
++
++interface RecoveryCandidate {
++  id: string;
++  label: string;
++  tagline: string;
++  icon: string;
++  additionalCost: number;
++  bookingsPreserved: number;
++  totalBookings: number;
++  timePenaltyMin: number;   // extra minutes added to arrival
++  droppedBookings: string[];
++  feasible: boolean;
++  reason: string;
++  arrivalTime: string;
++  actions: string[];
++  ranking: { costScore: number; timeScore: number; bookingScore: number; total: number };
++  explanation: string;
++}
++
++function estimateArrivalTime(baseTime: string | undefined, extraMin: number): string {
++  if (!baseTime) return 'Unknown';
++  try {
++    const d = new Date(baseTime);
++    d.setMinutes(d.getMinutes() + extraMin);
++    return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false });
++  } catch {
++    return 'Unknown';
++  }
++}
++
++export function generateRecoveryOptions(
++  tripId: string,
++  rawNodes: RawNode[],
++  rawEdges: Edge[],
++  brokenNodeId: string
++): RecoveryCandidate[] {
++  const nodes = rawNodes.map(n => ({ ...n, id: n.id ?? (n as any)._id?.toString() }));
++  const edges = rawEdges.map(e => ({ ...e, id: e.id ?? (e as any)._id?.toString() }));
++
++  const brokenNode = nodes.find(n => n.id === brokenNodeId);
++  if (!brokenNode) {
++    // Fallback: no broken node found, return a safe "wait and see" option
++    return [{
++      id: 'opt_wait',
++      label: 'Wait & Monitor',
++      tagline: 'No confirmed disruptions yet',
++      icon: 'ΓÅ│',
++      additionalCost: 0,
++      bookingsPreserved: nodes.length,
++      totalBookings: nodes.length,
++      timePenaltyMin: 0,
+       droppedBookings: [],
+-      confidence: 0.95,
+       feasible: true,
+-      reason: 'Direct replacement for the delayed flight.',
+-      arrivalTime: '19:30',
+-      actions: ['Book 6i-808 (IndiGo)'],
+-      ranking: { costScore: 40, timeScore: 90, bookingScore: 100 },
+-      explanation: 'Preserves all downstream plans but costs more.'
+-    },
+-    {
+-      id: 'opt2',
+-      label: 'Plan B: Push Cab & Dinner',
+-      tagline: 'Cheapest, delays arrival',
+-      icon: '≡ƒÜò',
+-      additionalCost: 1500,
+-      bookingsPreserved: 4,
+-      totalBookings: 5,
+-      timeSaved: 0,
+-      droppedBookings: ['Dinner at Sea Lounge'],
+-      confidence: 0.85,
++      reason: 'No broken node identified ΓÇö continue as planned and monitor.',
++      arrivalTime: estimateArrivalTime(nodes[nodes.length - 1]?.time, 0),
++      actions: ['Continue monitoring'],
++      ranking: { costScore: 100, timeScore: 100, bookingScore: 100, total: 100 },
++      explanation: 'Current plan is intact.',
++    }];
++  }
++
++  // Build the graph to find downstream impact
++  const graph = new TripGraph();
++  nodes.forEach(n => graph.addNode(n.id));
++  edges.forEach(e =>
++    graph.addEdge({
++      from: e.fromNodeId,
++      to: e.toNodeId,
++      bufferMin: e.bufferMin ?? 0,
++      paddingMin: e.paddingMin ?? 0,
++      constraint: e.constraint ?? 'soft',
++    })
++  );
++
++  const delayMin = (brokenNode as any).delay ?? 120;
++  const { broken: cascadeBroken, atRisk } = graph.propagateDelay(brokenNodeId, delayMin);
++
++  const affectedIds = new Set([brokenNodeId, ...cascadeBroken, ...atRisk]);
++  const unaffectedNodes = nodes.filter(n => !affectedIds.has(n.id));
++  const affectedNodes = nodes.filter(n => affectedIds.has(n.id) && n.id !== brokenNodeId);
++  const totalBookings = nodes.length;
++
++  // Last node's time as the baseline "planned arrival"
++  const lastNode = nodes[nodes.length - 1];
++
++  const candidates: RecoveryCandidate[] = [];
++
++  // --- Option 1: Skip the broken node, push all soft-constraint downstream nodes ---
++  {
++    const softDropped = affectedNodes.filter(n => n.constraintType === 'soft');
++    const hardBlocked = affectedNodes.filter(n => n.constraintType === 'hard');
++    const feasible = hardBlocked.length === 0;
++    const preserved = totalBookings - softDropped.length - 1; // -1 for the broken node itself
++    const timePenalty = delayMin; // arrival pushed by the full delay
++    const additionalCost = softDropped.reduce((sum, n) => sum + (n.refundPolicy ? 0 : 500), 0); // cancellation fees
++
++    candidates.push({
++      id: 'opt_skip',
++      label: 'Skip & Reschedule Soft Legs',
++      tagline: `Drop ${softDropped.length} flexible booking${softDropped.length !== 1 ? 's' : ''}, keep the rest`,
++      icon: 'Γ£é∩╕Å',
++      additionalCost,
++      bookingsPreserved: preserved,
++      totalBookings,
++      timePenaltyMin: timePenalty,
++      droppedBookings: softDropped.map(n => n.label),
++      feasible,
++      reason: feasible
++        ? 'No hard-constraint bookings are broken ΓÇö safe to drop flexible ones.'
++        : `${hardBlocked.length} hard-constraint booking(s) also broken ΓÇö not fully feasible.`,
++      arrivalTime: estimateArrivalTime(lastNode?.time, timePenalty),
++      actions: [
++        ...softDropped.map(n => `Cancel: ${n.label}`),
++        'Continue with remaining itinerary',
++      ],
++      ranking: { costScore: 0, timeScore: 0, bookingScore: 0, total: 0 }, // filled below
++      explanation: feasible
++        ? 'Preserves mandatory bookings at the cost of flexible ones.'
++        : 'Hard-constraint bookings are still at risk ΓÇö escalate to rebook.',
++    });
++  }
++
++  // --- Option 2: Rebook the broken node with an estimated replacement cost ---
++  {
++    const rebookCost = brokenNode.type === 'flight' ? 6500 : brokenNode.type === 'train' ? 1200 : 800;
++    const preserved = unaffectedNodes.length + affectedNodes.length; // all others preserved if rebook succeeds
++    const timePenalty = Math.max(0, delayMin - 60); // rebook shaves ~1 hour off delay
++
++    candidates.push({
++      id: 'opt_rebook',
++      label: `Rebook ${brokenNode.label || brokenNode.type}`,
++      tagline: 'Fastest recovery, higher cost',
++      icon: brokenNode.type === 'flight' ? 'Γ£ê∩╕Å' : brokenNode.type === 'train' ? '≡ƒÜå' : '≡ƒÜò',
++      additionalCost: rebookCost,
++      bookingsPreserved: preserved,
++      totalBookings,
++      timePenaltyMin: timePenalty,
++      droppedBookings: [],
++      feasible: true,
++      reason: `Replace ${brokenNode.label ?? brokenNode.type} with next available option.`,
++      arrivalTime: estimateArrivalTime(lastNode?.time, timePenalty),
++      actions: [`Book replacement ${brokenNode.type} for ${brokenNode.vendor ?? 'next available'}`],
++      ranking: { costScore: 0, timeScore: 0, bookingScore: 0, total: 0 },
++      explanation: 'Preserves all downstream plans but costs more.',
++    });
++  }
++
++  // --- Option 3: Add a phantom leg (cab/alternate transit) to bridge the gap ---
++  {
++    const phantomCost = 1500;
++    const timePenalty = delayMin + 30; // phantom adds extra transit time
++    const softDropped = affectedNodes.filter(n => n.constraintType === 'soft' && n.type !== 'hotel');
++    const preserved = totalBookings - softDropped.length - 1;
++
++    candidates.push({
++      id: 'opt_phantom',
++      label: 'Add Alternate Transit Leg',
++      tagline: 'Cheapest workaround, latest arrival',
++      icon: '≡ƒ¢║',
++      additionalCost: phantomCost,
++      bookingsPreserved: preserved,
++      totalBookings,
++      timePenaltyMin: timePenalty,
++      droppedBookings: softDropped.map(n => n.label),
+       feasible: true,
+-      reason: 'Wait for delayed flight, reschedule cab.',
+-      arrivalTime: '21:45',
+-      actions: ['Reschedule cab to 21:00', 'Cancel Dinner reservation'],
+-      ranking: { costScore: 90, timeScore: 40, bookingScore: 80 },
+-      explanation: 'Saves money but misses the dinner reservation.'
+-    }
+-  ];
+-
+-  return options;
++      reason: 'Use alternate road/local transit to bridge to next hard node.',
++      arrivalTime: estimateArrivalTime(lastNode?.time, timePenalty),
++      actions: [
++        'Book cab/auto to nearest interchange',
++        ...softDropped.map(n => `Reschedule: ${n.label}`),
++      ],
++      ranking: { costScore: 0, timeScore: 0, bookingScore: 0, total: 0 },
++      explanation: 'Cheapest option but adds travel time and drops some flexible bookings.',
++    });
++  }
++
++  // --- Normalise and score (Pareto multi-objective) ---
++  const maxCost = Math.max(...candidates.map(c => c.additionalCost), 1);
++  const maxTime = Math.max(...candidates.map(c => c.timePenaltyMin), 1);
++  const maxBooks = totalBookings;
++
++  candidates.forEach(c => {
++    const costScore = Math.round((1 - c.additionalCost / maxCost) * 100);
++    const timeScore = Math.round((1 - c.timePenaltyMin / maxTime) * 100);
++    const bookingScore = Math.round((c.bookingsPreserved / maxBooks) * 100);
++    // Weighted: 35% cost, 35% time, 30% bookings
++    const total = Math.round(costScore * 0.35 + timeScore * 0.35 + bookingScore * 0.30);
++    c.ranking = { costScore, timeScore, bookingScore, total };
++  });
++
++  // Sort by total score descending, mark the top one as recommended
++  candidates.sort((a, b) => b.ranking.total - a.ranking.total);
++
++  return candidates.slice(0, 3).map((c, i) => ({ ...c, recommended: i === 0 }));
+ }
+diff --git a/apps/worker/src/index.ts b/apps/worker/src/index.ts
+index 1d70562..291f639 100644
+--- a/apps/worker/src/index.ts
++++ b/apps/worker/src/index.ts
+@@ -1 +1,223 @@
+-console.log("Worker process started");
++/**
++ * YatraSarthi Background Worker
++ *
++ * Runs two recurring jobs:
++ *
++ * 1. Phantom Node Poller (every 5 minutes)
++ *    - Finds all nodes with status 'pending_review' that are within 3 hours of their scheduled time.
++ *    - Flags them as 'at_risk' and publishes a realtime warning so the user can confirm or replace.
++ *
++ * 2. Payment Timeout Sweep (every 10 minutes)
++ *    - Finds payments with status 'pending' where deadlineAt has passed.
++ *    - Marks them as 'failed'.
++ *    - If ALL payments for an action are now failed/refunded, moves that action back to 'proposed'
++ *      so the group can try again.
++ *
++ * Environment variables required:
++ *   MONGODB_URI       - MongoDB Atlas connection string
++ *   ABLY_API_KEY      - Ably REST publish key (optional; skipped gracefully if absent)
++ */
++
++import { MongoClient } from 'mongodb';
++
++const MONGODB_URI = process.env.MONGODB_URI;
++if (!MONGODB_URI) {
++  console.error('[worker] MONGODB_URI is not set ΓÇö exiting.');
++  process.exit(1);
++}
++
++let client: MongoClient;
++
++async function getDb() {
++  if (!client) {
++    client = new MongoClient(MONGODB_URI!);
++    await client.connect();
++    console.log('[worker] Connected to MongoDB');
++  }
++  return client.db();
++}
++
++// ΓöÇΓöÇΓöÇ Realtime helper (same logic as apps/web/src/lib/realtime.ts, inlined) ΓöÇΓöÇΓöÇ
++
++async function publishEvent(tripId: string, type: string, entityId: string) {
++  const apiKey = process.env.ABLY_API_KEY;
++  if (!apiKey) {
++    console.warn('[worker:realtime] ABLY_API_KEY not set ΓÇö skipping publish', type);
++    return;
++  }
++  const channel = `trip:${tripId}`;
++  const [keyId, keySecret] = apiKey.split(':');
++  const basicAuth = Buffer.from(`${keyId}:${keySecret}`).toString('base64');
++  try {
++    const res = await fetch(
++      `https://rest.ably.io/channels/${encodeURIComponent(channel)}/messages`,
++      {
++        method: 'POST',
++        headers: { Authorization: `Basic ${basicAuth}`, 'Content-Type': 'application/json' },
++        body: JSON.stringify({ name: type, data: { type, tripId, entityId, ts: new Date().toISOString() } }),
++      }
++    );
++    if (!res.ok) console.error('[worker:realtime] Ably publish failed:', res.status, await res.text());
++  } catch (err) {
++    console.error('[worker:realtime] Ably publish error:', err);
++  }
++}
++
++// ΓöÇΓöÇΓöÇ Job 1: Phantom Node Poller ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
++
++async function runPhantomPoller() {
++  console.log('[worker:phantom] Running phantom node poll...');
++  try {
++    const db = await getDb();
++    const now = new Date();
++    const windowEnd = new Date(now.getTime() + 3 * 60 * 60 * 1000); // 3 hours from now
++
++    // Find pending_review nodes whose scheduled time is within the next 3 hours
++    const phantomNodes = await db.collection('nodes').find({
++      status: 'pending_review',
++      type: 'phantom',
++      time: { $gte: now.toISOString(), $lte: windowEnd.toISOString() },
++    }).toArray();
++
++    if (phantomNodes.length === 0) {
++      console.log('[worker:phantom] No phantom nodes in the T-3h window.');
++      return;
++    }
++
++    console.log(`[worker:phantom] Found ${phantomNodes.length} phantom node(s) in the T-3h window.`);
++
++    for (const node of phantomNodes) {
++      const nodeId = node._id.toString();
++      const tripId = node.tripId;
++
++      // Flip to at_risk ΓÇö the user needs to confirm or replace this leg
++      await db.collection('nodes').updateOne(
++        { _id: node._id },
++        { $set: { status: 'at_risk', phantomWarningAt: now.toISOString() } }
++      );
++
++      // Append event log
++      const count = await db.collection('events').countDocuments({ tripId });
++      await db.collection('events').insertOne({
++        tripId,
++        seq: count + 1,
++        actor: 'system',
++        type: 'node.phantom_warning',
++        payload: { nodeId, label: node.label, scheduledTime: node.time },
++        ts: now.toISOString(),
++      });
++
++      // Publish realtime warning
++      await publishEvent(tripId, 'node.updated', nodeId);
++
++      console.log(`[worker:phantom] Flagged node ${nodeId} (${node.label}) as at_risk for trip ${tripId}`);
++    }
++  } catch (err) {
++    console.error('[worker:phantom] Error during phantom poll:', err);
++  }
++}
++
++// ΓöÇΓöÇΓöÇ Job 2: Payment Timeout Sweep ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
++
++async function runPaymentTimeoutSweep() {
++  console.log('[worker:payments] Running payment timeout sweep...');
++  try {
++    const db = await getDb();
++    const now = new Date();
++
++    // Find all pending payments whose deadline has passed
++    const expiredPayments = await db.collection('payments').find({
++      status: 'pending',
++      deadlineAt: { $lte: now.toISOString() },
++    }).toArray();
++
++    if (expiredPayments.length === 0) {
++      console.log('[worker:payments] No expired payments found.');
++      return;
++    }
++
++    console.log(`[worker:payments] Found ${expiredPayments.length} expired payment(s).`);
++
++    // Group expired payments by actionId
++    const byAction = new Map<string, typeof expiredPayments>();
++    for (const p of expiredPayments) {
++      const key = p.actionId;
++      if (!byAction.has(key)) byAction.set(key, []);
++      byAction.get(key)!.push(p);
++    }
++
++    for (const [actionId, payments] of byAction) {
++      // Mark expired payments as failed
++      const expiredIds = payments.map((p: any) => p._id);
++      await db.collection('payments').updateMany(
++        { _id: { $in: expiredIds } },
++        { $set: { status: 'failed', failedAt: now.toISOString() } }
++      );
++
++      // Check if ALL payments for this action are now non-pending
++      const stillPending = await db.collection('payments').countDocuments({
++        actionId,
++        status: 'pending',
++      });
++
++      if (stillPending === 0) {
++        // Roll the action back to 'proposed' so the group can try again
++        let action: any = null;
++        try { action = await db.collection('actions').findOne({ _id: new (require('mongodb').ObjectId)(actionId) }); } catch {}
++        if (!action) action = await db.collection('actions').findOne({ id: actionId });
++
++        if (action) {
++          const filter = action._id
++            ? { _id: action._id }
++            : { id: actionId };
++
++          await db.collection('actions').updateOne(
++            filter,
++            { $set: { state: 'proposed', updatedAt: now.toISOString() } }
++          );
++
++          const tripId: string = action.tripId;
++          // Append event log
++          const count = await db.collection('events').countDocuments({ tripId });
++          await db.collection('events').insertOne({
++            tripId,
++            seq: count + 1,
++            actor: 'system',
++            type: 'action.payment_timeout',
++            payload: { actionId, expiredCount: payments.length },
++            ts: now.toISOString(),
++          });
++
++          await publishEvent(tripId, 'action.updated', actionId);
++          console.log(`[worker:payments] Action ${actionId} rolled back to 'proposed' (all payments expired).`);
++        }
++      }
++    }
++  } catch (err) {
++    console.error('[worker:payments] Error during payment sweep:', err);
++  }
++}
++
++// ΓöÇΓöÇΓöÇ Scheduler ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
++
++function schedule(label: string, job: () => Promise<void>, intervalMs: number) {
++  console.log(`[worker] Scheduling "${label}" every ${intervalMs / 1000}s`);
++  job(); // run immediately on startup
++  setInterval(() => {
++    job().catch(err => console.error(`[worker] Unhandled error in "${label}":`, err));
++  }, intervalMs);
++}
++
++// ΓöÇΓöÇΓöÇ Entry point ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
++
++console.log('[worker] YatraSarthi worker starting...');
++
++schedule('Phantom Node Poller',    runPhantomPoller,        5  * 60 * 1000); // every 5 min
++schedule('Payment Timeout Sweep',  runPaymentTimeoutSweep,  10 * 60 * 1000); // every 10 min
++
++// Keep the process alive
++process.on('SIGTERM', async () => {
++  console.log('[worker] SIGTERM received ΓÇö shutting down gracefully.');
++  if (client) await client.close();
++  process.exit(0);
++});

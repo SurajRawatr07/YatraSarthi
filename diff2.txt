@@ -1,0 +1,1322 @@
+﻿diff --git a/apps/web/src/app/api/disruptions/report/route.ts b/apps/web/src/app/api/disruptions/report/route.ts
+index 3fe8c58..025fcd9 100644
+--- a/apps/web/src/app/api/disruptions/report/route.ts
++++ b/apps/web/src/app/api/disruptions/report/route.ts
+@@ -2,67 +2,216 @@ import { NextResponse } from 'next/server';
+ import clientPromise from '@/lib/mongodb';
+ import { TripGraph } from '@yatrasarthi/graph';
+ import { ObjectId } from 'mongodb';
++import { publishTripEvent, appendEventLog } from '@/lib/realtime';
+ import { Node, Edge } from '@yatrasarthi/types';
+ 
++/**
++ * POST /api/disruptions/report
++ *
++ * Body: { nodeId: string; delayMinutes: number; source: DisruptionSource; cause?: CauseFlag; tripId?: string }
++ *
++ * 1. Marks the broken node as `broken` in the DB
++ * 2. Runs TripGraph.propagateDelay() to find cascade effects
++ * 3. Updates all impacted nodes
++ * 4. Creates a disruption record + sets trip.activeDisruptionId
++ * 5. Recomputes and persists trip.healthScore and trip.status (needs_attention | resolving)
++ * 6. Returns the E2 Cascade Impact shape: disruptionId, brokenNode, effects[], affectedMemberIds
++ */
+ export async function POST(request: Request) {
+   try {
+-    const { tripId, nodeId, delayMin } = await request.json();
+-    if (!tripId || !nodeId || delayMin == null) {
+-      return NextResponse.json({ error: 'Missing parameters' }, { status: 400 });
++    const body = await request.json();
++
++    // Accept both delayMinutes (contract) and delayMin (legacy) so old clients still work
++    const {
++      nodeId,
++      delayMinutes,
++      delayMin,
++      source = 'user_reported',
++      cause,
++    } = body as {
++      nodeId: string;
++      delayMinutes?: number;
++      delayMin?: number;
++      source?: string;
++      cause?: string;
++      tripId?: string;  // optional, derived from node if missing
++    };
++
++    const delay = delayMinutes ?? delayMin ?? 0;
++
++    if (!nodeId || delay == null) {
++      return NextResponse.json(
++        { error: { code: 'VALIDATION_ERROR', message: 'nodeId and delayMinutes are required.' } },
++        { status: 422 }
++      );
+     }
+ 
+     const client = await clientPromise;
+     const db = client.db();
+ 
+-    // 1. Mark the reported node as delayed/broken
++    // Resolve node ΓÇö try ObjectId then string id field
++    let brokenNode: any = null;
++    if (ObjectId.isValid(nodeId)) {
++      brokenNode = await db.collection('nodes').findOne({ _id: new ObjectId(nodeId) });
++    }
++    if (!brokenNode) {
++      brokenNode = await db.collection('nodes').findOne({ id: nodeId });
++    }
++    if (!brokenNode) {
++      return NextResponse.json(
++        { error: { code: 'NOT_FOUND', message: 'Node not found.' } },
++        { status: 404 }
++      );
++    }
++
++    const tripId: string = body.tripId ?? brokenNode.tripId;
++    const brokenNodeStringId: string = brokenNode.id ?? brokenNode._id.toString();
++
++    // 1. Mark the broken node
++    const brokenFilter = ObjectId.isValid(nodeId)
++      ? { _id: new ObjectId(nodeId) }
++      : { id: nodeId };
+     await db.collection('nodes').updateOne(
+-      { _id: new ObjectId(nodeId) }, // or { id: nodeId } depending on schema
+-      { $set: { status: 'broken', delay: delayMin } }
++      brokenFilter,
++      { $set: { status: 'broken', delay, updatedAt: new Date().toISOString() } }
+     );
+ 
+-    // 2. Fetch all nodes and edges for the cascade
+-    const nodes = await db.collection('nodes').find({ tripId }).toArray() as unknown as Node[];
+-    const edges = await db.collection('edges').find({ tripId }).toArray() as unknown as Edge[];
++    // 2. Fetch all nodes and edges for this trip
++    const allNodes = await db.collection('nodes').find({ tripId }).toArray() as unknown as Node[];
++    const allEdges = await db.collection('edges').find({ tripId }).toArray() as unknown as Edge[];
+ 
+-    // 3. Build graph
++    // 3. Build graph and propagate
+     const graph = new TripGraph();
+-    nodes.forEach(n => graph.addNode(n.id || (n as any)._id.toString()));
+-    edges.forEach(e => graph.addEdge({
+-      from: e.fromNodeId,
+-      to: e.toNodeId,
+-      bufferMin: e.bufferMin,
+-      paddingMin: e.paddingMin,
+-      constraint: e.constraint
+-    }));
+-
+-    // 4. Run cascade
+-    const startNodeId = nodes.find(n => n.id === nodeId || (n as any)._id?.toString() === nodeId)?.id || nodeId;
+-    const { broken, atRisk, delay } = graph.propagateDelay(startNodeId, delayMin);
+-
+-    // 5. Update impacted nodes in DB
++    allNodes.forEach((n) => graph.addNode(n.id ?? (n as any)._id.toString()));
++    allEdges.forEach((e) =>
++      graph.addEdge({
++        from: e.fromNodeId,
++        to: e.toNodeId,
++        bufferMin: e.bufferMin ?? 0,
++        paddingMin: e.paddingMin ?? 0,
++        constraint: e.constraint ?? 'soft',
++      })
++    );
++
++    const { broken, atRisk } = graph.propagateDelay(brokenNodeStringId, delay);
++
++    // 4. Persist cascade status changes
+     if (broken.length > 0) {
+       await db.collection('nodes').updateMany(
+         { tripId, id: { $in: broken } },
+-        { $set: { status: 'broken' } }
++        { $set: { status: 'broken', updatedAt: new Date().toISOString() } }
+       );
+     }
+     if (atRisk.length > 0) {
+       await db.collection('nodes').updateMany(
+         { tripId, id: { $in: atRisk } },
+-        { $set: { status: 'at_risk' } }
++        { $set: { status: 'at_risk', updatedAt: new Date().toISOString() } }
+       );
+     }
+ 
+-    // 6. Compute new health score (simple mock logic: 100 - broken * 20 - atRisk * 10)
+-    const newHealth = Math.max(0, 100 - (broken.length * 20) - (atRisk.length * 10));
++    // 5. Build the disruption record
++    const disruptionDoc = {
++      tripId,
++      sourceNodeId: brokenNodeStringId,
++      delayMinutes: delay,
++      source,
++      cause: cause ?? 'unknown',
++      brokenNodes: [brokenNodeStringId, ...broken],
++      atRiskNodes: atRisk,
++      createdAt: new Date().toISOString(),
++    };
++    const disruption = await db.collection('disruptions').insertOne(disruptionDoc);
++    const disruptionId = disruption.insertedId.toString();
++
++    // 6. Compute new health score (100 - 20*broken - 10*at_risk, floor 0)
++    const totalBroken = broken.length + 1; // +1 for the origin node
++    const newHealthScore = Math.max(0, 100 - (totalBroken * 20) - (atRisk.length * 10));
++
++    // Set trip status: 'needs_attention' (no action yet) ΓÇö NOTE: transitions to 'resolving'
++    // once an action is proposed (handled by /propose route).
+     await db.collection('trips').updateOne(
+       { _id: new ObjectId(tripId) },
+-      { $set: { healthScore: newHealth, status: 'disrupted' } }
++      {
++        $set: {
++          healthScore: newHealthScore,
++          status: 'needs_attention',   // Contract ┬º0.5: one of healthy|needs_attention|resolving
++          activeDisruptionId: disruptionId,
++          updatedAt: new Date().toISOString(),
++        },
++      }
+     );
+ 
+-    return NextResponse.json({ success: true, cascade: { broken, atRisk, delay: Object.fromEntries(delay) }, healthScore: newHealth });
++    // 7. Build E2 Cascade Impact `effects[]` ΓÇö one entry per impacted downstream node
++    const nodeMap = new Map(
++      allNodes.map((n) => [n.id ?? (n as any)._id.toString(), n])
++    );
++    const edgeMap = new Map(
++      allEdges.map((e) => [e.fromNodeId + ':' + e.toNodeId, e])
++    );
++
++    const effects = [...broken, ...atRisk].map((nid) => {
++      const node = nodeMap.get(nid) as any;
++      const isHard = node?.constraintType === 'hard';
++      // Rough cost estimate: hard constraints (missed connection etc.) at 0, soft at a cancellation fee
++      const estimatedCost = isHard ? 0 : 150000; // Γé╣1500 in paise, rough placeholder
++      return {
++        nodeId: nid,
++        label: node?.label ?? nid,
++        consequence: isHard
++          ? 'Hard constraint ΓÇö cannot be delayed without rebooking'
++          : 'Will be delayed or missed if no action is taken',
++        estimatedCost,
++        hard: isHard,
++      };
++    });
++
++    // Collect affected member IDs from impacted nodes
++    const affectedMemberIds = [
++      ...new Set(
++        [...broken, ...atRisk, brokenNodeStringId]
++          .map((nid) => (nodeMap.get(nid) as any)?.ownerId)
++          .filter(Boolean)
++      ),
++    ];
++
++    // 8. Publish realtime events
++    await Promise.all([
++      publishTripEvent(tripId, { type: 'disruption.detected', entityId: disruptionId }),
++      publishTripEvent(tripId, { type: 'trip.updated', entityId: tripId }),
++      appendEventLog(db, {
++        tripId,
++        actor: 'system',
++        type: 'disruption.detected',
++        payload: {
++          disruptionId,
++          sourceNodeId: brokenNodeStringId,
++          delayMinutes: delay,
++          broken,
++          atRisk,
++        },
++      }),
++    ]);
++
++    // 9. Return the E2 Cascade Impact shape
++    return NextResponse.json({
++      data: {
++        disruptionId,
++        brokenNode: {
++          nodeId: brokenNodeStringId,
++          label: (brokenNode as any).label ?? nodeId,
++          delayMinutes: delay,
++          source,
++        },
++        effects,
++        affectedMemberIds,
++        healthScore: newHealthScore,
++      },
++    });
+   } catch (error) {
+-    console.error('Failed to report disruption', error);
+-    return NextResponse.json({ error: 'Failed to report disruption' }, { status: 500 });
++    console.error('[disruptions/report] Failed:', error);
++    return NextResponse.json(
++      { error: { code: 'INTERNAL', message: 'Failed to report disruption.' } },
++      { status: 500 }
++    );
+   }
+ }
+diff --git a/apps/web/src/app/api/trips/[id]/recovery-options/route.ts b/apps/web/src/app/api/trips/[id]/recovery-options/route.ts
+index 2237c5c..2cec922 100644
+--- a/apps/web/src/app/api/trips/[id]/recovery-options/route.ts
++++ b/apps/web/src/app/api/trips/[id]/recovery-options/route.ts
+@@ -3,32 +3,95 @@ import clientPromise from '@/lib/mongodb';
+ import { ObjectId } from 'mongodb';
+ import { generateRecoveryOptions } from '@/lib/recoveryRanker';
+ 
+-export async function GET(request: Request, { params }: { params: Promise<{ id: string }> }) {
++type RankingMode = 'cheapest' | 'fastest' | 'preserve_itinerary';
++
++/**
++ * GET /api/trips/:id/recovery-options
++ * Query: ?disruptionId=&mode=cheapest|fastest|preserve_itinerary
++ *
++ * Finds all broken nodes for the trip (or the specific disruption),
++ * runs the recovery ranker, and returns options in the contract-specified envelope.
++ *
++ * Response: { data: { options: RecoveryOption[] } }
++ */
++export async function GET(
++  request: Request,
++  { params }: { params: Promise<{ id: string }> }
++) {
+   try {
+     const { id } = await params;
++    const { searchParams } = new URL(request.url);
++    const disruptionId = searchParams.get('disruptionId');
++    const rawMode = searchParams.get('mode') ?? 'cheapest';
++    const mode: RankingMode = ['cheapest', 'fastest', 'preserve_itinerary'].includes(rawMode)
++      ? (rawMode as RankingMode)
++      : 'cheapest';
++
+     const client = await clientPromise;
+     const db = client.db();
+ 
+     const [nodes, edges, trip] = await Promise.all([
+-      db.collection('nodes').find({ tripId: id }).toArray(),
++      db.collection('nodes').find({ tripId: id }).sort({ time: 1 }).toArray(),
+       db.collection('edges').find({ tripId: id }).toArray(),
+-      db.collection('trips').findOne({ _id: new ObjectId(id) })
++      db.collection('trips').findOne({ _id: new ObjectId(id) }),
+     ]);
+ 
+     if (!trip) {
+-      return NextResponse.json({ error: 'Trip not found' }, { status: 404 });
++      return NextResponse.json(
++        { error: { code: 'NOT_FOUND', message: 'Trip not found.' } },
++        { status: 404 }
++      );
++    }
++
++    // Determine which broken node to base recovery options on:
++    // 1. If a disruptionId is provided, look up that specific disruption
++    // 2. Otherwise fall back to the trip's activeDisruptionId
++    // 3. Otherwise pick the first broken node
++    let brokenNodeId: string | null = null;
++
++    if (disruptionId && ObjectId.isValid(disruptionId)) {
++      const disruption = await db
++        .collection('disruptions')
++        .findOne({ _id: new ObjectId(disruptionId) });
++      brokenNodeId = disruption?.sourceNodeId ?? null;
++    }
++
++    if (!brokenNodeId && trip.activeDisruptionId) {
++      const activeDis = await db
++        .collection('disruptions')
++        .findOne({ _id: new ObjectId(trip.activeDisruptionId) });
++      brokenNodeId = activeDis?.sourceNodeId ?? null;
++    }
++
++    if (!brokenNodeId) {
++      // Fallback: first broken node in the trip
++      const firstBroken = (nodes as any[]).find((n) => n.status === 'broken');
++      brokenNodeId = firstBroken?.id ?? firstBroken?._id?.toString() ?? null;
+     }
+ 
+-    // In a real app, we'd pass the specific broken node id
+-    // For now, we mock it.
+-    const brokenNodeId = nodes.find((n: any) => n.status === 'broken')?.id || 'mock-id';
+-    
+-    // @ts-ignore
+-    const options = generateRecoveryOptions(id, nodes, edges, brokenNodeId);
++    if (!brokenNodeId) {
++      // No disruption found ΓÇö return empty list rather than mock data
++      return NextResponse.json({ data: { options: [] } });
++    }
++
++    // Normalise IDs
++    const mappedNodes = (nodes as any[]).map((n) => ({
++      ...n,
++      id: n.id ?? n._id?.toString(),
++    }));
++    const mappedEdges = (edges as any[]).map((e) => ({
++      ...e,
++      id: e.id ?? e._id?.toString(),
++    }));
++
++    const options = generateRecoveryOptions(id, mappedNodes, mappedEdges, brokenNodeId, mode);
+ 
+-    return NextResponse.json({ recoveryOptions: options });
++    return NextResponse.json({ data: { options } });
+   } catch (error) {
+-    console.error('Failed to get recovery options', error);
+-    return NextResponse.json({ error: 'Failed to get recovery options' }, { status: 500 });
++    console.error('[recovery-options] Failed:', error);
++    return NextResponse.json(
++      { error: { code: 'INTERNAL', message: 'Failed to get recovery options.' } },
++      { status: 500 }
++    );
+   }
+ }
+diff --git a/apps/web/src/components/DisruptionSimulator.tsx b/apps/web/src/components/DisruptionSimulator.tsx
+index c8b46ba..c6c948a 100644
+--- a/apps/web/src/components/DisruptionSimulator.tsx
++++ b/apps/web/src/components/DisruptionSimulator.tsx
+@@ -1,48 +1,62 @@
+ import { useState } from 'react';
+ import { AlertTriangle, Play, Loader, Clock, Ban, Train, Car, CloudRain, User } from 'lucide-react';
+ 
++// Scenario definitions ΓÇö each maps to a node type + delay for the API call
+ export const disruptionScenarios = [
+   {
+     id: 'flight_delay',
+     label: 'IndiGo 6E-204 Delayed',
+     description: 'Flight delayed by 2h 15m. Impacts cab pickup and Airbnb check-in window.',
+     icon: <Clock size={16} />,
+-    type: 'delay',
++    type: 'flight',
++    delayMinutes: 135,
++    source: 'flight_provider',
+   },
+   {
+     id: 'train_delay',
+     label: 'Vande Bharat Delayed',
+     description: 'Delayed by 4 hours. Group misses Goa connecting cab.',
+     icon: <Train size={16} />,
+-    type: 'delay',
++    type: 'train',
++    delayMinutes: 240,
++    source: 'train_unofficial',
+   },
+   {
+     id: 'cab_cancel',
+     label: 'Cab driver cancelled',
+     description: 'Shared cab from airport cancelled 15 mins before arrival.',
+     icon: <Ban size={16} />,
+-    type: 'cancel',
++    type: 'cab',
++    delayMinutes: 90,
++    source: 'user_reported',
+   },
+   {
+     id: 'weather',
+     label: 'Heavy rain alert',
+     description: 'Red alert in destination city. High risk of localized flooding.',
+     icon: <CloudRain size={16} />,
+-    type: 'weather',
++    type: 'cab',
++    delayMinutes: 180,
++    source: 'road_eta',
+   },
+   {
+     id: 'member_sick',
+     label: 'Member dropping out',
+-    description: 'Nupur reporting sick, dropping out. Requires split payment recalculation.',
++    description: 'Member reporting sick, dropping out. Requires plan recalculation.',
+     icon: <User size={16} />,
+-    type: 'member',
+-  }
++    type: 'phantom',
++    delayMinutes: 60,
++    source: 'user_reported',
++  },
+ ];
+ 
+-interface DisruptionSimulatorProps {
+-  onDisrupt: (scenarioId: string) => void;
+-  isDisrupted: boolean;
+-}
++const scenarioIcons: Record<string, React.ReactNode> = {
++  flight_delay: <Clock size={15} />,
++  train_delay: <Train size={15} />,
++  cab_cancel: <Ban size={15} />,
++  weather: <CloudRain size={15} />,
++  member_sick: <User size={15} />,
++};
+ 
+ const processingSteps = [
+   'Detecting disruptionΓÇª',
+@@ -53,40 +67,99 @@ const processingSteps = [
+   'Generating recovery optionsΓÇª',
+ ];
+ 
+-const scenarioIcons: Record<string, React.ReactNode> = {
+-  flight_delay: <Clock size={15} />,
+-  flight_cancel: <Ban size={15} />,
+-  train_delay: <Train size={15} />,
+-  cab_unavail: <Car size={15} />,
+-  road_delay: <CloudRain size={15} />,
+-  user_late: <User size={15} />,
+-};
++// Shape returned by POST /api/disruptions/report
++interface CascadeEffect {
++  nodeId: string;
++  label: string;
++  consequence: string;
++  estimatedCost: number;
++  hard: boolean;
++}
++
++interface DisruptionResult {
++  disruptionId: string;
++  brokenNode: { nodeId: string; label: string; delayMinutes: number; source: string };
++  effects: CascadeEffect[];
++  affectedMemberIds: string[];
++  healthScore: number;
++}
++
++interface DisruptionSimulatorProps {
++  /** tripId: needed to call the real disruptions API */
++  tripId: string;
++  /** nodes: used to find the first node matching the scenario type */
++  nodes?: { id: string; type: string; label: string }[];
++  /** Called with the full disruption result once the cascade is computed */
++  onDisrupt: (scenarioId: string, result?: DisruptionResult) => void;
++  isDisrupted: boolean;
++}
+ 
+-export function DisruptionSimulator({ onDisrupt, isDisrupted }: DisruptionSimulatorProps) {
++export function DisruptionSimulator({ tripId, nodes = [], onDisrupt, isDisrupted }: DisruptionSimulatorProps) {
+   const [selected, setSelected] = useState<string | null>(null);
+   const [processing, setProcessing] = useState(false);
+   const [step, setStep] = useState(0);
+   const [done, setDone] = useState(false);
++  const [result, setResult] = useState<DisruptionResult | null>(null);
++  const [error, setError] = useState<string | null>(null);
+ 
+-  const handleSimulate = () => {
++  const handleSimulate = async () => {
+     if (!selected || processing) return;
++
++    const scenario = disruptionScenarios.find((s) => s.id === selected);
++    if (!scenario) return;
++
+     setProcessing(true);
+     setDone(false);
++    setError(null);
++    setResult(null);
+     setStep(0);
+ 
+-    const tick = (i: number) => {
++    // Animate the processing steps in parallel with the real API call
++    const animateTick = (i: number) => {
+       setStep(i);
+       if (i < processingSteps.length - 1) {
+-        setTimeout(() => tick(i + 1), 550);
+-      } else {
+-        setTimeout(() => {
+-          setProcessing(false);
+-          setDone(true);
+-          onDisrupt(selected);
+-        }, 550);
++        setTimeout(() => animateTick(i + 1), 500);
+       }
+     };
+-    tick(0);
++    animateTick(0);
++
++    try {
++      // Find the first node matching the scenario's type, or fall back to the first node
++      const targetNode = nodes.find((n) => n.type === scenario.type) ?? nodes[0];
++
++      let cascadeResult: DisruptionResult | undefined;
++
++      if (targetNode && tripId && tripId !== 'default') {
++        // Real API call ΓÇö use the contract field name `delayMinutes`
++        const res = await fetch('/api/disruptions/report', {
++          method: 'POST',
++          headers: { 'Content-Type': 'application/json' },
++          body: JSON.stringify({
++            nodeId: targetNode.id,
++            delayMinutes: scenario.delayMinutes,
++            source: scenario.source,
++          }),
++        });
++
++        if (res.ok) {
++          const json = await res.json();
++          cascadeResult = json?.data as DisruptionResult;
++          setResult(cascadeResult);
++        }
++      }
++
++      // Wait for animation to finish (last step takes ~3s total)
++      setTimeout(() => {
++        setProcessing(false);
++        setDone(true);
++        onDisrupt(selected, cascadeResult);
++      }, processingSteps.length * 500 + 100);
++    } catch (err) {
++      setProcessing(false);
++      setError('Could not reach the server. Disruption simulated locally.');
++      setDone(true);
++      onDisrupt(selected, undefined);
++    }
+   };
+ 
+   return (
+@@ -97,12 +170,12 @@ export function DisruptionSimulator({ onDisrupt, isDisrupted }: DisruptionSimula
+         </div>
+         <div>
+           <h3 className="font-bold" style={{ color: '#172017' }}>Disruption Simulator</h3>
+-          <p className="text-xs" style={{ color: '#5F665B' }}>See how your connected trip responds ┬╖ Simulated data</p>
++          <p className="text-xs" style={{ color: '#5F665B' }}>See how your connected trip responds ┬╖ Live cascade</p>
+         </div>
+       </div>
+ 
+       <div className="grid grid-cols-2 gap-2 mb-4">
+-        {disruptionScenarios.map(scenario => (
++        {disruptionScenarios.map((scenario) => (
+           <button
+             key={scenario.id}
+             onClick={() => setSelected(scenario.id)}
+@@ -131,9 +204,9 @@ export function DisruptionSimulator({ onDisrupt, isDisrupted }: DisruptionSimula
+                 {i < step ? (
+                   <span style={{ color: '#2E7D32', fontWeight: 'bold' }}>Γ£ô</span>
+                 ) : i === step ? (
+-                  <Loader size={11} style={{ color: '#172017', animation: 'spin-slow 1s linear infinite' }} />
++                  <Loader size={11} style={{ color: '#172017', animation: 'spin 1s linear infinite' }} />
+                 ) : (
+-                  <span className="w-3 h-3 rounded-full border" style={{ borderColor: '#D5D9CC' }} />
++                  <span className="w-3 h-3 rounded-full border inline-block" style={{ borderColor: '#D5D9CC' }} />
+                 )}
+                 {s}
+               </div>
+@@ -145,18 +218,55 @@ export function DisruptionSimulator({ onDisrupt, isDisrupted }: DisruptionSimula
+       {done && !processing && (
+         <div className="mb-4 p-4 rounded-xl border" style={{ background: '#FDEDEC', borderColor: '#F5B7B1' }}>
+           <div className="font-semibold text-sm mb-1" style={{ color: '#D93829' }}>Cascade detected</div>
+-          <div className="text-xs" style={{ color: '#5F665B' }}>3 components affected. Recovery options generated in Recovery tab.</div>
++          {result ? (
++            <div className="flex flex-col gap-1">
++              <div className="text-xs" style={{ color: '#5F665B' }}>
++                <span className="font-semibold">{result.brokenNode.label}</span> delayed by{' '}
++                <span className="font-semibold">{result.brokenNode.delayMinutes}m</span>
++              </div>
++              {result.effects.length > 0 && (
++                <div className="mt-1.5 flex flex-col gap-1">
++                  {result.effects.slice(0, 3).map((effect) => (
++                    <div key={effect.nodeId} className="text-xs flex items-start gap-1.5" style={{ color: '#5F665B' }}>
++                      <span style={{ color: effect.hard ? '#D93829' : '#B06000' }}>
++                        {effect.hard ? '≡ƒö┤' : '≡ƒƒí'}
++                      </span>
++                      <span>{effect.label} ΓÇö {effect.consequence}</span>
++                    </div>
++                  ))}
++                  {result.effects.length > 3 && (
++                    <div className="text-xs" style={{ color: '#858B80' }}>
++                      +{result.effects.length - 3} more affected
++                    </div>
++                  )}
++                </div>
++              )}
++              <div className="mt-2 text-xs font-semibold" style={{ color: '#5F665B' }}>
++                Recovery options generated ΓåÆ Recovery tab
++              </div>
++            </div>
++          ) : (
++            <div className="text-xs" style={{ color: '#5F665B' }}>
++              {error ?? 'Disruption simulated. Recovery options generated in Recovery tab.'}
++            </div>
++          )}
++        </div>
++      )}
++
++      {error && !processing && (
++        <div className="mb-3 text-xs px-3 py-2 rounded-xl" style={{ background: '#FFF3CD', color: '#856404' }}>
++          {error}
+         </div>
+       )}
+ 
+       <button
+         onClick={handleSimulate}
+         disabled={!selected || processing}
+-        className="btn-primary w-full py-3 text-sm"
++        className="btn-primary w-full py-3 text-sm flex items-center justify-center gap-2"
+         style={{ opacity: !selected || processing ? 0.5 : 1, cursor: !selected || processing ? 'not-allowed' : 'pointer' }}
+       >
+-        <Play size={14} />
+-        Simulate disruption
++        {processing ? <Loader size={14} style={{ animation: 'spin 1s linear infinite' }} /> : <Play size={14} />}
++        {processing ? 'SimulatingΓÇª' : 'Simulate disruption'}
+       </button>
+     </div>
+   );
+diff --git a/apps/web/src/components/recovery/RecoveryOptions.tsx b/apps/web/src/components/recovery/RecoveryOptions.tsx
+index 6fc3905..2c8f89a 100644
+--- a/apps/web/src/components/recovery/RecoveryOptions.tsx
++++ b/apps/web/src/components/recovery/RecoveryOptions.tsx
+@@ -22,25 +22,42 @@ interface RecoveryOptionsProps {
+   tripId: string;
+   /** Pre-loaded options (passed from TripControlCenter when already fetched) */
+   options?: RecoveryOptionData[];
+-  /** Called when a "Propose to group" button is clicked */
++  /** Map of nodeId ΓåÆ label for resolving dropped node ids to human-readable names */
++  nodeLabels?: Record<string, string>;
++  /** Called when "Propose to group" is clicked; receives the new actionId */
+   onProposed?: (actionId: string) => void;
+ }
+ 
+-export function RecoveryOptionsPanel({ tripId, options: initialOptions, onProposed }: RecoveryOptionsProps) {
++type RankingMode = 'cheapest' | 'fastest' | 'preserve_itinerary';
++
++const MODE_LABELS: Record<RankingMode, string> = {
++  cheapest: 'Cheapest',
++  fastest: 'Fastest',
++  preserve_itinerary: 'Preserve itinerary',
++};
++
++export function RecoveryOptionsPanel({
++  tripId,
++  options: initialOptions,
++  nodeLabels = {},
++  onProposed,
++}: RecoveryOptionsProps) {
+   const [options, setOptions] = useState<RecoveryOptionData[]>(initialOptions ?? []);
+   const [loading, setLoading] = useState(false);
+   const [proposing, setProposing] = useState<string | null>(null);
+   const [proposed, setProposed] = useState<string | null>(null);
+   const [view, setView] = useState<'cards' | 'compare'>('cards');
++  const [mode, setMode] = useState<RankingMode>('cheapest');
+   const [error, setError] = useState<string | null>(null);
+ 
+-  const loadOptions = async () => {
++  const loadOptions = async (rankingMode: RankingMode = mode) => {
+     setLoading(true);
+     setError(null);
+     try {
+-      const res = await fetch(`/api/trips/${tripId}/recovery-options`);
++      // Pass ?mode= query param per api_contract.md ┬º6
++      const res = await fetch(`/api/trips/${tripId}/recovery-options?mode=${rankingMode}`);
+       const data = await res.json();
+-      // Support both { data: { options } } and legacy { recoveryOptions }
++      // Support both { data: { options } } (contract) and legacy { recoveryOptions }
+       const opts = data?.data?.options ?? data?.recoveryOptions ?? [];
+       setOptions(opts);
+     } catch {
+@@ -50,18 +67,22 @@ export function RecoveryOptionsPanel({ tripId, options: initialOptions, onPropos
+     }
+   };
+ 
++  const handleModeChange = (newMode: RankingMode) => {
++    setMode(newMode);
++    loadOptions(newMode);
++  };
++
+   const handlePropose = async (optionId: string) => {
+     setProposing(optionId);
+     setError(null);
+     try {
+-      // Create or update the action doc by calling the propose endpoint
+       const res = await fetch(`/api/actions/${optionId}/propose`, {
+         method: 'POST',
+         headers: { 'Content-Type': 'application/json' },
+         body: JSON.stringify({ tripId, optionId }),
+       });
+       const data = await res.json();
+-      const actionId = data?.data?.id ?? data?.action?.id ?? optionId;
++      const actionId = data?.data?.action?.id ?? data?.data?.id ?? data?.action?.id ?? optionId;
+       setProposed(optionId);
+       onProposed?.(actionId);
+     } catch {
+@@ -72,7 +93,7 @@ export function RecoveryOptionsPanel({ tripId, options: initialOptions, onPropos
+   };
+ 
+   const scatterData = options.map((o, i) => ({
+-    x: o.netCost / 100,          // convert paise ΓåÆ rupees for display
++    x: Math.round(o.netCost / 100), // paise ΓåÆ rupees
+     y: parseInt(o.arrivalTime.replace(':', '')),
+     name: o.name,
+     color: ['#172017', '#4E8752', '#858B80'][i % 3],
+@@ -80,14 +101,13 @@ export function RecoveryOptionsPanel({ tripId, options: initialOptions, onPropos
+ 
+   return (
+     <div className="card p-6 bg-white border" style={{ borderColor: '#D5D9CC' }}>
++      {/* Header */}
+       <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
+         <div>
+-          <h3 className="font-bold text-lg" style={{ color: '#172017' }}>
+-            Recovery Options
+-          </h3>
++          <h3 className="font-bold text-lg" style={{ color: '#172017' }}>Recovery Options</h3>
+           <p className="text-sm mt-0.5" style={{ color: '#5F665B' }}>
+             {options.length > 0
+-              ? `${options.length} option${options.length !== 1 ? 's' : ''} available ΓÇö ranked by preference`
++              ? `${options.length} option${options.length !== 1 ? 's' : ''} ΓÇö ranked by preference`
+               : 'Load options to see available recovery paths'}
+           </p>
+         </div>
+@@ -111,32 +131,53 @@ export function RecoveryOptionsPanel({ tripId, options: initialOptions, onPropos
+             </div>
+           )}
+           <button
+-            onClick={loadOptions}
++            onClick={() => loadOptions()}
+             disabled={loading}
+             className="flex items-center gap-2 text-xs font-semibold px-3 py-1.5 rounded-xl border"
+             style={{ borderColor: '#D5D9CC', background: '#EDE9D8', color: '#172017' }}
+           >
+             {loading ? <Loader2 size={13} className="animate-spin" /> : <ChevronRight size={13} />}
+-            {loading ? 'LoadingΓÇª' : 'Refresh'}
++            {loading ? 'LoadingΓÇª' : options.length > 0 ? 'Refresh' : 'Load options'}
+           </button>
+         </div>
+       </div>
+ 
++      {/* Ranking mode toggle ΓÇö E3 preference toggle */}
++      <div className="flex gap-1.5 mb-4">
++        {(Object.keys(MODE_LABELS) as RankingMode[]).map((m) => (
++          <button
++            key={m}
++            onClick={() => handleModeChange(m)}
++            className="text-xs px-3 py-1.5 rounded-full font-semibold transition-colors"
++            style={{
++              background: mode === m ? '#172017' : '#F5F2E8',
++              color: mode === m ? '#F5F2E8' : '#5F665B',
++              border: `1px solid ${mode === m ? '#172017' : '#D5D9CC'}`,
++            }}
++          >
++            {MODE_LABELS[m]}
++          </button>
++        ))}
++      </div>
++
++      {/* Error */}
+       {error && (
+         <div className="mb-4 p-3 rounded-xl text-sm" style={{ background: '#FDECEA', color: '#B03028' }}>
+           {error}
+         </div>
+       )}
+ 
++      {/* Empty state */}
+       {options.length === 0 && !loading && (
+         <div className="text-center py-8" style={{ color: '#5F665B' }}>
+           <p className="text-sm mb-4">No options loaded yet.</p>
+-          <button onClick={loadOptions} className="btn-primary px-5 py-2 text-sm">
++          <button onClick={() => loadOptions()} className="btn-primary px-5 py-2 text-sm">
+             Load recovery options
+           </button>
+         </div>
+       )}
+ 
++      {/* Cards view */}
+       {options.length > 0 && view === 'cards' && (
+         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+           {options.map((option, i) => (
+@@ -144,6 +185,7 @@ export function RecoveryOptionsPanel({ tripId, options: initialOptions, onPropos
+               key={option.optionId}
+               option={option}
+               rank={i}
++              nodeLabels={nodeLabels}
+               isProposed={proposed === option.optionId}
+               isProposing={proposing === option.optionId}
+               onPropose={() => handlePropose(option.optionId)}
+@@ -152,16 +194,24 @@ export function RecoveryOptionsPanel({ tripId, options: initialOptions, onPropos
+         </div>
+       )}
+ 
++      {/* Compare (Pareto scatter) view */}
+       {options.length > 0 && view === 'compare' && (
+         <div className="card p-6" style={{ background: '#F5F2E8', borderColor: '#D5D9CC' }}>
+-          <h4 className="font-semibold mb-2" style={{ color: '#172017' }}>Cost vs. Arrival time</h4>
++          <h4 className="font-semibold mb-1" style={{ color: '#172017' }}>Cost vs. Arrival time</h4>
++          <p className="text-xs mb-3" style={{ color: '#5F665B' }}>
++            Lower-left is better ΓÇö cheapest and earliest arrival.
++          </p>
+           <div style={{ height: 240 }}>
+             <ResponsiveContainer width="100%" height="100%">
+               <ScatterChart margin={{ top: 10, right: 20, bottom: 20, left: 20 }}>
+                 <CartesianGrid stroke="#D5D9CC" strokeDasharray="4 4" />
+-                <XAxis type="number" dataKey="x" name="Cost" tickFormatter={(v) => `Γé╣${v}`} />
++                <XAxis type="number" dataKey="x" name="Cost" tickFormatter={(v) => `Γé╣${v.toLocaleString()}`} />
+                 <YAxis type="number" dataKey="y" name="Arrival" />
+-                <Tooltip />
++                <Tooltip
++                  formatter={(value: number, name: string) =>
++                    name === 'Cost' ? [`Γé╣${value.toLocaleString()}`, name] : [value, name]
++                  }
++                />
+                 {scatterData.map((d, i) => (
+                   <Scatter key={i} data={[d]} fill={d.color} name={d.name} />
+                 ))}
+@@ -177,12 +227,14 @@ export function RecoveryOptionsPanel({ tripId, options: initialOptions, onPropos
+ function OptionCard({
+   option,
+   rank,
++  nodeLabels,
+   isProposed,
+   isProposing,
+   onPropose,
+ }: {
+   option: RecoveryOptionData;
+   rank: number;
++  nodeLabels: Record<string, string>;
+   isProposed: boolean;
+   isProposing: boolean;
+   onPropose: () => void;
+@@ -191,6 +243,15 @@ function OptionCard({
+   const netCostRupees = Math.round(option.netCost / 100);
+   const compensationRupees = option.possibleCompensation ? Math.round(option.possibleCompensation / 100) : 0;
+ 
++  // Resolve nodeId ΓåÆ label; fall back to the id if not in the map
++  const droppedLabels = option.nodesDropped?.map((id) => nodeLabels[id] ?? id) ?? [];
++
++  // Quote expiry countdown
++  const expiresAt = option.quoteExpiresAt ? new Date(option.quoteExpiresAt) : null;
++  const expiresMinStr = expiresAt
++    ? Math.max(0, Math.floor((expiresAt.getTime() - Date.now()) / 60000)) + 'm'
++    : null;
++
+   return (
+     <div
+       className="card p-5 flex flex-col gap-3 border"
+@@ -205,23 +266,59 @@ function OptionCard({
+           Γ¡É Recommended
+         </div>
+       )}
++
+       <div className="font-bold text-sm" style={{ color: colors[rank] ?? '#172017' }}>{option.name}</div>
++
++      {/* Cost */}
+       <div>
+         <div className="text-2xl font-extrabold" style={{ color: '#172017' }}>
+-          +Γé╣{netCostRupees.toLocaleString()}
++          {netCostRupees === 0 ? 'Free' : `+Γé╣${netCostRupees.toLocaleString()}`}
+         </div>
+         {compensationRupees > 0 && (
+           <div className="text-xs mt-0.5" style={{ color: '#4E8752' }}>
+-            Possible compensation: Γé╣{compensationRupees.toLocaleString()}
++            Possible DGCA compensation: up to Γé╣{compensationRupees.toLocaleString()} ΓÇö not guaranteed
+           </div>
+         )}
+       </div>
++
++      {/* Details */}
+       <div className="flex flex-col gap-1 text-xs" style={{ color: '#5F665B' }}>
+         <div><Check size={11} className="inline mr-1 text-[#2E7D32]" />Arrival: {option.arrivalTime}</div>
+-        {option.nodesDropped?.map((d) => (
+-          <div key={d}><X size={11} className="inline mr-1 text-[#D93829]" />Drops: {d}</div>
++        {droppedLabels.map((label) => (
++          <div key={label}><X size={11} className="inline mr-1 text-[#D93829]" />Drops: {label}</div>
+         ))}
+       </div>
++
++      {/* Score bars */}
++      <div className="flex flex-col gap-1">
++        {([
++          ['Cost', option.scoreBreakdown.costNorm, '#4E8752'],
++          ['Time', option.scoreBreakdown.timeNorm, '#172017'],
++          ['Itinerary', option.scoreBreakdown.nodesNorm, '#C5D82D'],
++        ] as [string, number, string][]).map(([label, score, color]) => (
++          <div key={label} className="flex items-center gap-1.5">
++            <div className="text-xs w-14" style={{ color: '#858B80' }}>{label}</div>
++            <div className="flex-1 h-1.5 rounded-full" style={{ background: '#EDE9D8' }}>
++              <div
++                className="h-full rounded-full"
++                style={{ width: `${Math.round(score * 100)}%`, background: color, transition: 'width 0.4s' }}
++              />
++            </div>
++            <div className="text-xs w-7 text-right" style={{ color: '#858B80' }}>
++              {Math.round(score * 100)}
++            </div>
++          </div>
++        ))}
++      </div>
++
++      {/* Quote expiry */}
++      {expiresMinStr && (
++        <div className="text-xs" style={{ color: '#858B80' }}>
++          Price valid for ~{expiresMinStr}
++        </div>
++      )}
++
++      {/* CTA */}
+       {isProposed ? (
+         <div className="py-2 rounded-xl text-xs font-semibold text-center" style={{ background: '#DCE8D2', color: '#172017' }}>
+           Γ£ô Proposed to group
+diff --git a/apps/web/src/lib/recoveryRanker.ts b/apps/web/src/lib/recoveryRanker.ts
+index 10f02f7..35c7cb4 100644
+--- a/apps/web/src/lib/recoveryRanker.ts
++++ b/apps/web/src/lib/recoveryRanker.ts
+@@ -4,12 +4,18 @@ import { TripGraph } from '@yatrasarthi/graph';
+ /**
+  * Real recovery option ranker.
+  *
++ * Output shape matches both:
++ * - The `RecoveryOption` interface in packages/types (api_contract.md ┬º1)
++ * - The `RecoveryOptionData` interface in components/recovery/RecoveryOptions.tsx
++ *
+  * Strategy:
+- * 1. Find the broken node and all downstream nodes it affects via TripGraph.
+- * 2. Generate candidate recovery strategies (skip broken, reschedule downstream, add phantom leg).
+- * 3. Score each candidate on 3 axes: cost, time penalty, bookings preserved.
+- * 4. Normalise scores 0-100, compute a weighted total, sort descending.
+- * 5. Return top 3 options.
++ * 1. Find the broken node and run TripGraph to get cascade impact
++ * 2. Generate 3 candidate strategies (skip-soft, rebook, phantom leg)
++ * 3. Score on 3 axes: cost, time penalty, bookings preserved
++ * 4. Normalise scores 0-1 (Pareto), compute weighted total
++ * 5. Sort descending, mark top as recommended
++ *
++ * Scoring weights: 35% cost ┬╖ 35% time ┬╖ 30% bookings (matches api_contract ┬º6)
+  */
+ 
+ interface RawNode extends Node {
+@@ -17,28 +23,18 @@ interface RawNode extends Node {
+   delay?: number;
+ }
+ 
+-interface RecoveryCandidate {
+-  id: string;
+-  label: string;
+-  tagline: string;
+-  icon: string;
+-  additionalCost: number;
+-  bookingsPreserved: number;
+-  totalBookings: number;
+-  timePenaltyMin: number;   // extra minutes added to arrival
+-  droppedBookings: string[];
+-  feasible: boolean;
+-  reason: string;
+-  arrivalTime: string;
+-  actions: string[];
+-  ranking: { costScore: number; timeScore: number; bookingScore: number; total: number };
+-  explanation: string;
+-}
++type RankingMode = 'cheapest' | 'fastest' | 'preserve_itinerary';
++
++const MODE_WEIGHTS: Record<RankingMode, { cost: number; time: number; bookings: number }> = {
++  cheapest:           { cost: 0.60, time: 0.20, bookings: 0.20 },
++  fastest:            { cost: 0.20, time: 0.60, bookings: 0.20 },
++  preserve_itinerary: { cost: 0.20, time: 0.20, bookings: 0.60 },
++};
+ 
+-function estimateArrivalTime(baseTime: string | undefined, extraMin: number): string {
+-  if (!baseTime) return 'Unknown';
++function arrivalTimeFromDelay(baseIso: string | undefined, extraMin: number): string {
++  if (!baseIso) return 'Unknown';
+   try {
+-    const d = new Date(baseTime);
++    const d = new Date(baseIso);
+     d.setMinutes(d.getMinutes() + extraMin);
+     return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false });
+   } catch {
+@@ -46,41 +42,43 @@ function estimateArrivalTime(baseTime: string | undefined, extraMin: number): st
+   }
+ }
+ 
++function isoExpiry(fromNow: number): string {
++  return new Date(Date.now() + fromNow).toISOString();
++}
++
+ export function generateRecoveryOptions(
+   tripId: string,
+   rawNodes: RawNode[],
+   rawEdges: Edge[],
+-  brokenNodeId: string
+-): RecoveryCandidate[] {
+-  const nodes = rawNodes.map(n => ({ ...n, id: n.id ?? (n as any)._id?.toString() }));
+-  const edges = rawEdges.map(e => ({ ...e, id: e.id ?? (e as any)._id?.toString() }));
++  brokenNodeId: string,
++  mode: RankingMode = 'cheapest'
++) {
++  const nodes = rawNodes.map((n) => ({ ...n, id: n.id ?? (n as any)._id?.toString() }));
++  const edges = rawEdges.map((e) => ({ ...e, id: e.id ?? (e as any)._id?.toString() }));
++
++  const brokenNode = nodes.find((n) => n.id === brokenNodeId) as any;
++  const totalBookings = nodes.filter((n) => n.type !== 'phantom').length;
+ 
+-  const brokenNode = nodes.find(n => n.id === brokenNodeId);
+   if (!brokenNode) {
+-    // Fallback: no broken node found, return a safe "wait and see" option
+     return [{
+-      id: 'opt_wait',
+-      label: 'Wait & Monitor',
+-      tagline: 'No confirmed disruptions yet',
+-      icon: 'ΓÅ│',
+-      additionalCost: 0,
+-      bookingsPreserved: nodes.length,
+-      totalBookings: nodes.length,
+-      timePenaltyMin: 0,
+-      droppedBookings: [],
+-      feasible: true,
+-      reason: 'No broken node identified ΓÇö continue as planned and monitor.',
+-      arrivalTime: estimateArrivalTime(nodes[nodes.length - 1]?.time, 0),
+-      actions: ['Continue monitoring'],
+-      ranking: { costScore: 100, timeScore: 100, bookingScore: 100, total: 100 },
+-      explanation: 'Current plan is intact.',
++      optionId: 'opt_wait',
++      name: 'Wait & Monitor',
++      netCost: 0,
++      possibleCompensation: 0,
++      arrivalTime: arrivalTimeFromDelay(nodes[nodes.length - 1]?.time, 0),
++      nodesDropped: [],
++      recommended: true,
++      scoreBreakdown: { costNorm: 1, timeNorm: 1, nodesNorm: 1 },
++      changes: [],
++      perMemberShare: [],
++      quoteExpiresAt: isoExpiry(30 * 60 * 1000),
+     }];
+   }
+ 
+-  // Build the graph to find downstream impact
++  // Build graph and propagate delay
+   const graph = new TripGraph();
+-  nodes.forEach(n => graph.addNode(n.id));
+-  edges.forEach(e =>
++  nodes.forEach((n) => graph.addNode(n.id));
++  edges.forEach((e) =>
+     graph.addEdge({
+       from: e.fromNodeId,
+       to: e.toNodeId,
+@@ -90,124 +88,156 @@ export function generateRecoveryOptions(
+     })
+   );
+ 
+-  const delayMin = (brokenNode as any).delay ?? 120;
++  const delayMin = brokenNode.delay ?? 120;
+   const { broken: cascadeBroken, atRisk } = graph.propagateDelay(brokenNodeId, delayMin);
+ 
+   const affectedIds = new Set([brokenNodeId, ...cascadeBroken, ...atRisk]);
+-  const unaffectedNodes = nodes.filter(n => !affectedIds.has(n.id));
+-  const affectedNodes = nodes.filter(n => affectedIds.has(n.id) && n.id !== brokenNodeId);
+-  const totalBookings = nodes.length;
+-
+-  // Last node's time as the baseline "planned arrival"
++  const affectedNodes = nodes.filter((n) => affectedIds.has(n.id) && n.id !== brokenNodeId) as any[];
++  const unaffectedNodes = nodes.filter((n) => !affectedIds.has(n.id)) as any[];
+   const lastNode = nodes[nodes.length - 1];
+ 
+-  const candidates: RecoveryCandidate[] = [];
++  // Collect member IDs for per-member share split (evenly split among affected members)
++  const memberIds = [...new Set(nodes.map((n: any) => n.ownerId).filter(Boolean))];
++
++  interface Candidate {
++    optionId: string;
++    name: string;
++    netCost: number;            // paise
++    possibleCompensation: number;
++    arrivalTime: string;
++    nodesDropped: string[];
++    timePenaltyMin: number;
++    bookingsPreserved: number;
++    recommended: boolean;
++    scoreBreakdown: { costNorm: number; timeNorm: number; nodesNorm: number };
++    changes: { nodeId: string; field: string; from: unknown; to: unknown }[];
++    perMemberShare: { memberId: string; amount: number }[];
++    quoteExpiresAt: string;
++  }
++
++  const candidates: Candidate[] = [];
+ 
+-  // --- Option 1: Skip the broken node, push all soft-constraint downstream nodes ---
++  // ΓöÇΓöÇ Option 1: Skip soft-constraint downstream nodes, keep hard ones ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+   {
+-    const softDropped = affectedNodes.filter(n => n.constraintType === 'soft');
+-    const hardBlocked = affectedNodes.filter(n => n.constraintType === 'hard');
++    const softDropped = affectedNodes.filter((n) => n.constraintType !== 'hard');
++    const hardBlocked = affectedNodes.filter((n) => n.constraintType === 'hard');
+     const feasible = hardBlocked.length === 0;
+-    const preserved = totalBookings - softDropped.length - 1; // -1 for the broken node itself
+-    const timePenalty = delayMin; // arrival pushed by the full delay
+-    const additionalCost = softDropped.reduce((sum, n) => sum + (n.refundPolicy ? 0 : 500), 0); // cancellation fees
++
++    // Cancellation cost: Γé╣500 per non-refundable soft booking
++    const cancelCost = softDropped.reduce(
++      (sum, n) => sum + (n.refundPolicy?.source === 'unmatched' ? 50000 : 0),
++      0
++    );
++    const preserved = unaffectedNodes.length;  // bookings kept
+ 
+     candidates.push({
+-      id: 'opt_skip',
+-      label: 'Skip & Reschedule Soft Legs',
+-      tagline: `Drop ${softDropped.length} flexible booking${softDropped.length !== 1 ? 's' : ''}, keep the rest`,
+-      icon: 'Γ£é∩╕Å',
+-      additionalCost,
++      optionId: 'opt_skip',
++      name: 'Skip & Reschedule',
++      netCost: cancelCost,
++      possibleCompensation: 0,
++      arrivalTime: arrivalTimeFromDelay(lastNode?.time, delayMin),
++      nodesDropped: softDropped.map((n) => n.id),
++      timePenaltyMin: delayMin,
+       bookingsPreserved: preserved,
+-      totalBookings,
+-      timePenaltyMin: timePenalty,
+-      droppedBookings: softDropped.map(n => n.label),
+-      feasible,
+-      reason: feasible
+-        ? 'No hard-constraint bookings are broken ΓÇö safe to drop flexible ones.'
+-        : `${hardBlocked.length} hard-constraint booking(s) also broken ΓÇö not fully feasible.`,
+-      arrivalTime: estimateArrivalTime(lastNode?.time, timePenalty),
+-      actions: [
+-        ...softDropped.map(n => `Cancel: ${n.label}`),
+-        'Continue with remaining itinerary',
+-      ],
+-      ranking: { costScore: 0, timeScore: 0, bookingScore: 0, total: 0 }, // filled below
+-      explanation: feasible
+-        ? 'Preserves mandatory bookings at the cost of flexible ones.'
+-        : 'Hard-constraint bookings are still at risk ΓÇö escalate to rebook.',
++      recommended: false,
++      scoreBreakdown: { costNorm: 0, timeNorm: 0, nodesNorm: 0 },
++      changes: softDropped.map((n) => ({
++        nodeId: n.id,
++        field: 'status',
++        from: n.status,
++        to: 'cancelled',
++      })),
++      perMemberShare: memberIds.map((mid) => ({ memberId: mid, amount: Math.round(cancelCost / memberIds.length) })),
++      quoteExpiresAt: isoExpiry(30 * 60 * 1000),
+     });
+   }
+ 
+-  // --- Option 2: Rebook the broken node with an estimated replacement cost ---
++  // ΓöÇΓöÇ Option 2: Rebook the broken node ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+   {
+-    const rebookCost = brokenNode.type === 'flight' ? 6500 : brokenNode.type === 'train' ? 1200 : 800;
+-    const preserved = unaffectedNodes.length + affectedNodes.length; // all others preserved if rebook succeeds
+-    const timePenalty = Math.max(0, delayMin - 60); // rebook shaves ~1 hour off delay
++    const rebookCostPaise =
++      brokenNode.type === 'flight' ? 650000 :
++      brokenNode.type === 'train'  ? 120000 :
++      brokenNode.type === 'hotel'  ? 300000 : 80000;
++
++    // DGCA compensation applies when flight delay > 2h and airline-controlled
++    const possibleCompensation = brokenNode.type === 'flight' && delayMin >= 120 ? 1000000 : 0;
++    const timeSaved = Math.max(0, delayMin - 60);
++    const preserved = totalBookings; // rebook keeps everything
+ 
+     candidates.push({
+-      id: 'opt_rebook',
+-      label: `Rebook ${brokenNode.label || brokenNode.type}`,
+-      tagline: 'Fastest recovery, higher cost',
+-      icon: brokenNode.type === 'flight' ? 'Γ£ê∩╕Å' : brokenNode.type === 'train' ? '≡ƒÜå' : '≡ƒÜò',
+-      additionalCost: rebookCost,
++      optionId: 'opt_rebook',
++      name: `Rebook ${brokenNode.label || brokenNode.type}`,
++      netCost: rebookCostPaise,
++      possibleCompensation,
++      arrivalTime: arrivalTimeFromDelay(lastNode?.time, delayMin - timeSaved),
++      nodesDropped: [],
++      timePenaltyMin: delayMin - timeSaved,
+       bookingsPreserved: preserved,
+-      totalBookings,
+-      timePenaltyMin: timePenalty,
+-      droppedBookings: [],
+-      feasible: true,
+-      reason: `Replace ${brokenNode.label ?? brokenNode.type} with next available option.`,
+-      arrivalTime: estimateArrivalTime(lastNode?.time, timePenalty),
+-      actions: [`Book replacement ${brokenNode.type} for ${brokenNode.vendor ?? 'next available'}`],
+-      ranking: { costScore: 0, timeScore: 0, bookingScore: 0, total: 0 },
+-      explanation: 'Preserves all downstream plans but costs more.',
++      recommended: false,
++      scoreBreakdown: { costNorm: 0, timeNorm: 0, nodesNorm: 0 },
++      changes: [{ nodeId: brokenNodeId, field: 'status', from: 'broken', to: 'on_track' }],
++      perMemberShare: memberIds.map((mid) => ({
++        memberId: mid,
++        amount: Math.round(rebookCostPaise / memberIds.length),
++      })),
++      quoteExpiresAt: isoExpiry(20 * 60 * 1000), // prices expire in 20min
+     });
+   }
+ 
+-  // --- Option 3: Add a phantom leg (cab/alternate transit) to bridge the gap ---
++  // ΓöÇΓöÇ Option 3: Add a phantom transit leg to bridge the gap ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+   {
+-    const phantomCost = 1500;
+-    const timePenalty = delayMin + 30; // phantom adds extra transit time
+-    const softDropped = affectedNodes.filter(n => n.constraintType === 'soft' && n.type !== 'hotel');
+-    const preserved = totalBookings - softDropped.length - 1;
++    const phantomCostPaise = 150000; // Γé╣1500
++    const softDropped = affectedNodes.filter(
++      (n) => n.constraintType !== 'hard' && !['hotel', 'flight', 'train'].includes(n.type)
++    );
++    const preserved = unaffectedNodes.length + (affectedNodes.length - softDropped.length);
+ 
+     candidates.push({
+-      id: 'opt_phantom',
+-      label: 'Add Alternate Transit Leg',
+-      tagline: 'Cheapest workaround, latest arrival',
+-      icon: '≡ƒ¢║',
+-      additionalCost: phantomCost,
++      optionId: 'opt_phantom',
++      name: 'Add Alternate Transit',
++      netCost: phantomCostPaise,
++      possibleCompensation: 0,
++      arrivalTime: arrivalTimeFromDelay(lastNode?.time, delayMin + 30),
++      nodesDropped: softDropped.map((n) => n.id),
++      timePenaltyMin: delayMin + 30,
+       bookingsPreserved: preserved,
+-      totalBookings,
+-      timePenaltyMin: timePenalty,
+-      droppedBookings: softDropped.map(n => n.label),
+-      feasible: true,
+-      reason: 'Use alternate road/local transit to bridge to next hard node.',
+-      arrivalTime: estimateArrivalTime(lastNode?.time, timePenalty),
+-      actions: [
+-        'Book cab/auto to nearest interchange',
+-        ...softDropped.map(n => `Reschedule: ${n.label}`),
++      recommended: false,
++      scoreBreakdown: { costNorm: 0, timeNorm: 0, nodesNorm: 0 },
++      changes: [
++        ...softDropped.map((n) => ({ nodeId: n.id, field: 'status', from: n.status, to: 'cancelled' })),
++        {
++          nodeId: 'phantom_new',
++          field: 'type',
++          from: null,
++          to: 'phantom',
++        },
+       ],
+-      ranking: { costScore: 0, timeScore: 0, bookingScore: 0, total: 0 },
+-      explanation: 'Cheapest option but adds travel time and drops some flexible bookings.',
++      perMemberShare: memberIds.map((mid) => ({
++        memberId: mid,
++        amount: Math.round(phantomCostPaise / memberIds.length),
++      })),
++      quoteExpiresAt: isoExpiry(30 * 60 * 1000),
+     });
+   }
+ 
+-  // --- Normalise and score (Pareto multi-objective) ---
+-  const maxCost = Math.max(...candidates.map(c => c.additionalCost), 1);
+-  const maxTime = Math.max(...candidates.map(c => c.timePenaltyMin), 1);
+-  const maxBooks = totalBookings;
+-
+-  candidates.forEach(c => {
+-    const costScore = Math.round((1 - c.additionalCost / maxCost) * 100);
+-    const timeScore = Math.round((1 - c.timePenaltyMin / maxTime) * 100);
+-    const bookingScore = Math.round((c.bookingsPreserved / maxBooks) * 100);
+-    // Weighted: 35% cost, 35% time, 30% bookings
+-    const total = Math.round(costScore * 0.35 + timeScore * 0.35 + bookingScore * 0.30);
+-    c.ranking = { costScore, timeScore, bookingScore, total };
++  // ΓöÇΓöÇ Normalise scores (0ΓåÆ1) and apply mode weights ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
++  const maxCost = Math.max(...candidates.map((c) => c.netCost), 1);
++  const maxTime = Math.max(...candidates.map((c) => c.timePenaltyMin), 1);
++  const maxBooks = Math.max(totalBookings, 1);
++
++  const weights = MODE_WEIGHTS[mode] ?? MODE_WEIGHTS.cheapest;
++
++  const scored = candidates.map((c) => {
++    const costNorm = 1 - c.netCost / maxCost;
++    const timeNorm = 1 - c.timePenaltyMin / maxTime;
++    const nodesNorm = c.bookingsPreserved / maxBooks;
++    const total = costNorm * weights.cost + timeNorm * weights.time + nodesNorm * weights.bookings;
++    return { ...c, scoreBreakdown: { costNorm, timeNorm, nodesNorm }, _total: total };
+   });
+ 
+-  // Sort by total score descending, mark the top one as recommended
+-  candidates.sort((a, b) => b.ranking.total - a.ranking.total);
++  scored.sort((a, b) => b._total - a._total);
++  scored[0].recommended = true;
+ 
+-  return candidates.slice(0, 3).map((c, i) => ({ ...c, recommended: i === 0 }));
++  // Strip internal _total before returning
++  return scored.slice(0, 3).map(({ _total, ...rest }) => rest);
+ }

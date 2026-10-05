@@ -1,0 +1,21 @@
+{
+  "name": "YatraSarthi",
+  "short_name": "YatraSarthi",
+  "description": "Travel Disruption Management & Intelligence",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#F5F2E8",
+  "theme_color": "#172017",
+  "icons": [
+    {
+      "src": "/icons/icon-192.jpg",
+      "sizes": "192x192",
+      "type": "image/jpeg"
+    },
+    {
+      "src": "/icons/icon-512.jpg",
+      "sizes": "512x512",
+      "type": "image/jpeg"
+    }
+  ]
+}
